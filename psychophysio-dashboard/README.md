@@ -1,4 +1,4 @@
-# PsyPhyBoard
+# PsyPhy Datalab
 
 Dashboard w **Streamlit** do przeglądania zsynchronizowanych w czasie sygnałów psychofizjologicznych (oddech, EDA, sygnał HR itd.) oraz transkryptu — w kontekście badań z psychofizjolingwistyki i cognitive science.
 

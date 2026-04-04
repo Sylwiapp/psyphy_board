@@ -1,5 +1,5 @@
 """
-PsyPhyBoard — dashboard: oddech, puls, ECG, EDA + segmenty sesji + transkrypt z kursorem czasu.
+PsyPhy Datalab — dashboard: oddech, puls, ECG, EDA + segmenty sesji + transkrypt z kursorem czasu.
 Surowe vs przetworzone (jak w typowym pipeline: QC vs przegląd).
 
 Uruchomienie: py -3 -m streamlit run app.py
@@ -21,7 +21,7 @@ from transcript_io import Utterance, load_transcript_auto, load_transcript_json_
 from data_loader import find_vhdr_files, load_brainvision_auxiliary
 import viz_gallery as vg
 
-APP_NAME = "PsyPhyBoard"
+APP_NAME = "PsyPhy Datalab"
 
 # Stałe trybów nawigacji (jedno źródło prawdy — radio + logika osi X)
 NAV_FULL = "Pełna sesja"
@@ -264,7 +264,7 @@ def fig_overlay_normalized(
         yaxis_title="0–1 (znormalizowane)",
         legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5),
         margin=dict(l=50, r=20, t=80, b=40),
-        uirevision="psyphyboard",
+        uirevision="psyphy_datalab",
     )
     apply_x_range_overlay(fig, x_range)
     fig.update_yaxes(range=(-0.02, 1.02))
@@ -315,7 +315,7 @@ def fig_stacked(
         showlegend=False,
         margin=dict(l=50, r=20, t=48, b=36),
         title=dict(text=f"Sygnały — {title_suffix}", font=dict(size=15)),
-        uirevision="psyphyboard",
+        uirevision="psyphy_datalab",
     )
     fig.update_xaxes(title_text="Czas od startu sesji (s)", row=4, col=1)
     apply_x_range_stacked(fig, rows, x_range)

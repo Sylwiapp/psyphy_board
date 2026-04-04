@@ -1,5 +1,5 @@
 """
-Warianty wizualizacji pod PsyPhyBoard — do porównań i rozmów z promotorką.
+Warianty wizualizacji pod PsyPhy Datalab — do porównań i rozmów z promotorką.
 Dane: syntetyczne lub przetworzone DataFrame z kolumnami time_s, oddech, puls_bpm, ecg_mv, eda_us.
 """
 

@@ -1,5 +1,5 @@
 """
-Uniwersalne wczytywanie transkryptu z timestamami (PsyPhyBoard / psychofizjolingwistyka).
+Uniwersalne wczytywanie transkryptu z timestamami (PsyPhy Datalab / psychofizjolingwistyka).
 
 Obsługiwane formaty:
 1) JSON — zalecany do metadanych i walidacji
