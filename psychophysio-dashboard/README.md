@@ -1,63 +1,89 @@
 # PsyPhy Datalab
 
-Dashboard w **Streamlit** do przeglądania zsynchronizowanych w czasie sygnałów psychofizjologicznych (oddech, EDA, sygnał HR itd.) oraz transkryptu — w kontekście badań z psychofizjolingwistyki i cognitive science.
+Dashboard w **Streamlit** do przeglądania w czasie sygnałów psychofizjologicznych (oddech, EDA, tor HR itd.) wraz z **transkryptem** — pod eksplorację pojedynczej sesji i przygotowanie pod dalszą analizę (m.in. psychofizjolingwistyka, cognitive science).
 
-Stan repozytorium odpowiada prototypowi narzędzia do eksploracji sesji, rozmów z promotorką o wizualizacjach oraz przygotowania pod dalsze moduły (EEG, kwestionariusze, agregaty grupowe).
+To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC nie zastępują opisu metody w publikacji ani procedur w laboratorium.
 
-## Funkcje (skrót)
+## Funkcje
 
-- **Źródło danych:** tryb syntetyczny (demo) albo pliki **BrainVision** (`.vhdr` + `.eeg` w folderze `data`) — kanały pomocnicze typu Resp / GSR / HR z nagłówka nagrania.
-- **Wykresy:** szeregi czasowe (subploty), nakładka czterech kanałów po normalizacji min–max, nawigacja po osi czasu (pełna sesja / okno wokół kursora / segment).
-- **Transkrypt:** JSON lub CSV (`start_s`, `end_s`, `text`) — podświetlanie wypowiedzi wg kursora czasu; klik w wykres Plotly ustawia kursor przy kolejnym odświeżeniu (ograniczenie Streamlit).
-- **Galeria wizualizacji:** histogramy, korelacje, boxploty po segmentach, spektrogram (SciPy), uproszczony podział EDA tonic/phasic, itd.
+- **Źródło danych:** tryb **syntetyczny** (demo) albo **BrainVision** — pliki `.vhdr` + `.eeg` w folderze `data/` (rekurencyjnie, także podfoldery). Ostatnie cztery kanały w typowym zapisie 68-kanałowym są mapowane na: oddech (Resp01T), drugi tor oddechu / „ECG” w UI (Resp02B), EDA (GSR), sygnał HR z nagłówka (µV; kolumna w kodzie historycznie `puls_bpm`).
+- **Sesja i transkrypt:** cztery szeregi czasowe (surowe i wersja wygładzona / rzadsza), nakładka po normalizacji min–max, **nawigacja** po osi czasu (cała sesja / okno wokół kursora / segmenty), transkrypt w iframe z podświetleniem wg kursora.
+- **Walidacja po wczytaniu** (expander): heurystyki dla BV (Fs, NaN, zmienność torów, stałe zera na dodatkowych kanałach) oraz dla transkryptu (przedziały czasu, długość vs sesja, nakładania itd.).
+- **Galeria:** histogramy, korelacje, wykresy po segmentach, spektrogram (z decymacją przy bardzo długich nagraniach), uproszczony podział EDA tonic/phasic, zmienność pulsu w oknach.
+- **QC / preprocessing — ECG:** tor `ecg_mv`, filtracja, detekcja R (heurystyka), histogram RR, krótkie podsumowanie jakości (parametryzowalne progi).
+
+**Uwagi techniczne:** wykresy Plotly używają **decymacji kopertą min/max**, żeby nie przekraczać limitu rozmiaru wiadomości Streamlit przy długich nagraniach wysokiej częstotliwości. Parser `.vhdr` czyta **nazwy i rozdzielczości kanałów tylko z sekcji `[Channel Infos]`** — linie `ChN=…` z sekcji `[Coordinates]` nie nadpisują już skali.
 
 ## Wymagania
 
 - Python 3.10+ (testowane m.in. na 3.14)
-- Zależności w `requirements.txt`
+- Zależności w `requirements.txt` (Streamlit, Plotly, pandas, NumPy, SciPy)
 
 ## Instalacja i uruchomienie
 
-```bash
-cd psychophysio-dashboard
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-```
+1. **Sklonuj repozytorium** (lub rozpakuj archiwum) i przejdź do folderu projektu:
+   ```bash
+   cd psychophysio-dashboard
+   ```
+2. **Zainstaluj zależności:**
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
+   Na Windowsie, jeśli `python` nie jest w PATH:
+   ```bash
+   py -3 -m pip install -r requirements.txt
+   ```
+3. **Dane BrainVision** (często **poza Gitem**: duży `.eeg`, wrażliwość danych): skopiuj lokalnie do `data/`:
+   - plik **`*.vhdr`**,
+   - **`*.eeg`** o nazwie z pola `DataFile=` w `[Common Infos]` (np. `DataFile=MK_0123.eeg` → `data/MK_0123.eeg` obok tego samego nagłówka),
+   - opcjonalnie `*.vmrk` i inne pliki z sesji rekordera.
+   Bez **niepustego** `.eeg` wczytanie próbek się nie uda — aplikacja pokaże komunikat z rozmiarem ścieżki.
+4. **Transkrypt (opcjonalnie):** JSON lub CSV wg formatu z `data/transcript.example.json` / opisu w UI.
+5. **Uruchom:**
+   ```bash
+   python -m streamlit run app.py
+   ```
+   (lub `py -3 -m streamlit run app.py` na Windowsie.)
 
-Na Windowsie, jeśli `python` nie jest w PATH:
-
-```bash
-py -3 -m pip install -r requirements.txt
-py -3 -m streamlit run app.py
-```
-
-Aplikacja otworzy się w przeglądarce (domyślnie `http://localhost:8501`).
+Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhdr`, ewentualnie plik transkryptu.
 
 ## Struktura projektu
 
 | Plik / folder | Opis |
 |---------------|------|
-| `app.py` | Główna aplikacja Streamlit |
-| `data_loader.py` | Wczytywanie BrainVision (nagłówek + binarny `.eeg`) |
+| `app.py` | Aplikacja Streamlit (zakładki: sesja, galeria, QC ECG) |
+| `data_loader.py` | BrainVision: nagłówek `.vhdr`, multipleks INT16 z `.eeg` |
+| `data_validation.py` | Raporty walidacji BV i transkryptu |
+| `ecg_qc.py` | Preprocessing i heurystyczny QC toru `ecg_mv` |
 | `transcript_io.py` | Wczytywanie transkryptu JSON / CSV |
-| `viz_gallery.py` | Dodatkowe typy wykresów (galeria) |
-| `data/` | Przykładowe metadane / nagłówki; **pełne nagrania binarne zwykle nie są commitowane** (duży rozmiar, dane osobowe) |
+| `viz_gallery.py` | Wykresy galerii |
+| `data/` | Dane sesji, przykłady transkryptów; opcjonalnie `validation_samples/` (małe pliki BV do testów QC) |
+| `.gitignore` | m.in. `__pycache__/` |
 
 ## Dane w `data/`
 
-- **BrainVision:** obok `*.vhdr` musi leżeć plik `*.eeg` wskazany w nagłówku (np. `DataFile=MK_0123.eeg`). Bez `.eeg` wczytanie próbek nie jest możliwe.
-- Pliki `Data-*.txt` z logów impedancji **nie** są szeregami czasowymi sygnałów.
-- Transkrypt: zobacz `data/transcript.example.json` i opis w aplikacji (expander „Format plików transkryptu”).
+- **BrainVision:** spójny zestaw `.vhdr` + `.eeg` (i ewentualnie `.vmrk`). Pliki `Data-*.txt` to **logi impedancji**, nie szereg czasowy sygnału.
+- **Repozytorium:** rozważ `.gitignore` na `*.eeg` / duże surowe pliki, jeśli nie mają trafiać na zdalne repo; **RODO / etyka badań** przy udostępnianiu danych.
 
-Przed publikacją repozytorium na GitHubie rozważ:
+## Zagadnienia do rozważenia
 
-- dodanie `*.eeg` (i ewentualnie dużych surowych plików) do `.gitignore`;
-- nie umieszczanie danych osobowych bez zgody i zgodnie z regulacjami (RODO / etyka badań).
+- **Synchronizacja czasu** między rekorderem BV, audio, transkryptem (wspólna oś w sekundach vs osobne korekty).
+- **Publikacja vs eksploracja:** które wersje sygnału (surowy / filtrowany / decymowany) idą do rozdziałów metody i figur.
+- **Segmentacja:** równe bloki czasu w UI vs **markery** z `.vmrk` lub zewnętrznego harmonogramu zadania.
+- **Jednostki i nazewnictwo:** oś „puls” jako sygnał z czujnika (µV) vs wyliczone BPM; spójność podpisów osi z metodą.
+- **QC i HRV:** obecna detekcja R to orientacyjny pipeline — przed analizą HRV warto ustalić finalny łańcuch z narzędziami klinicznymi lub zespołową procedurą.
+
+## Dalsze kroki rozwoju (skrót)
+
+- Wczytywanie **markerów** (np. z `.vmrk`) na oś czasu i warunki eksperymentalne.
+- **Kwestionariusze** (CSV) i łączenie z `subject_id` / sesją na wykresach.
+- Moduł **EEG** (osobna ścieżka czasu, epoki, ewentualnie MNE).
+- Eksport figur (rozdzielczość, fonty) i ewentualnie testy automatyczne dla `data_loader` / walidacji.
 
 ## Licencja i cytowanie
 
-Dopisz plik `LICENSE` oraz ewentualnie sposób cytowania, jeśli projekt ma być udostępniany publicznie.
+Dodaj `LICENSE` i zasady cytowania, jeśli projekt ma być publiczny.
 
 ## Autorstwo
 
-Uzupełnij sekcję autorów / kontaktu według potrzeb zespołu lub pracy dyplomowej.
+Uzupełnij autorów / kontakt według potrzeb pracy lub zespołu.
