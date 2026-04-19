@@ -33,19 +33,16 @@ To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC n
    ```bash
    py -3 -m pip install -r requirements.txt
    ```
-3. **Dane BrainVision** (często **poza Gitem**: duży `.eeg`, wrażliwość danych): skopiuj lokalnie do `data/`:
-   - plik **`*.vhdr`**,
-   - **`*.eeg`** o nazwie z pola `DataFile=` w `[Common Infos]` (np. `DataFile=MK_0123.eeg` → `data/MK_0123.eeg` obok tego samego nagłówka),
-   - opcjonalnie `*.vmrk` i inne pliki z sesji rekordera.
-   Bez **niepustego** `.eeg` wczytanie próbek się nie uda — aplikacja pokaże komunikat z rozmiarem ścieżki.
-4. **Transkrypt (opcjonalnie):** JSON lub CSV wg formatu z `data/transcript.example.json` / opisu w UI.
-5. **Uruchom:**
+3. **Dodaj własne dane do folderu `data/`** (w katalogu projektu, obok `app.py` — folder nazywa się dokładnie **`data`**). Tam kładziesz pliki sesji, które chcesz przeglądać; aplikacja **skanuje `data/` rekurencyjnie** (możesz też użyć podfolderów). Surowe nagrania zwykle **nie są commitowane** do Gita — patrz `.gitignore`.
+   - **BrainVision:** skopiuj **`*.vhdr`** oraz **`*.eeg`** o nazwie z pola `DataFile=` w `[Common Infos]` nagłówka (np. `DataFile=MK_0123.eeg` → plik `data/MK_0123.eeg` **obok** tego samego `.vhdr`), opcjonalnie **`*.vmrk`** i inne pliki z rekordera. Bez **niepustego** `.eeg` wczytanie próbek się nie uda — w UI pojawi się komunikat z rozmiarem ścieżki.
+   - **Transkrypt (opcjonalnie):** JSON lub CSV wg formatu z `data/transcript.example.json` / opisu w aplikacji — możesz trzymać go w `data/` i wskazać w sidebarze.
+4. **Uruchom:**
    ```bash
    python -m streamlit run app.py
    ```
    (lub `py -3 -m streamlit run app.py` na Windowsie.)
 
-Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhdr`, ewentualnie plik transkryptu.
+Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhdr` z listy (pliki z `data/`), ewentualnie plik transkryptu.
 
 ## Struktura projektu
 
@@ -63,7 +60,7 @@ Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhd
 ## Dane w `data/`
 
 - **BrainVision:** spójny zestaw `.vhdr` + `.eeg` (i ewentualnie `.vmrk`). Pliki `Data-*.txt` to **logi impedancji**, nie szereg czasowy sygnału.
-- **Repozytorium:** rozważ `.gitignore` na `*.eeg` / duże surowe pliki, jeśli nie mają trafiać na zdalne repo; **RODO / etyka badań** przy udostępnianiu danych.
+- **Repozytorium:** w `.gitignore` są wzorce na surowe pliki sesji w `data/` (`.eeg`, `.vhdr`, `.vmrk`, logi impedancji, transkrypt JSON poza przykładem, folder `articles/`). **Małe fixture’y** zostają w `data/validation_samples/`. **RODO / etyka** przy udostępnianiu danych poza Gitem.
 
 ## Zagadnienia do rozważenia
 

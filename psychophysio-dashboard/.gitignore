@@ -1,1 +1,14 @@
 __pycache__/
+
+# Dane sesji / pomiar?w w katalogu data/ (trzymaj lokalnie — opis w README)
+data/*.eeg
+data/*.vhdr
+data/*.vmrk
+data/Data-*.txt
+
+# W?asny transkrypt wrzucony do data/*.json — w repo zostaje tylko przyk?ad
+data/*.json
+!data/transcript.example.json
+
+# Lokalna biblioteka PDF (nie kod projektu)
+data/articles/
