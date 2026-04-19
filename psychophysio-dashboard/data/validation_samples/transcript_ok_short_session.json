@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "time_reference": "seconds_from_session_start",
+  "note": "Pasuje do krótkich nagrań testowych (~8 s), np. bv_val_ok.",
+  "utterances": [
+    { "start_s": 0.5, "end_s": 2.0, "text": "Krótka fraza na początku." },
+    { "start_s": 3.0, "end_s": 6.5, "text": "Druga wypowiedź przed końcem nagrania." }
+  ]
+}

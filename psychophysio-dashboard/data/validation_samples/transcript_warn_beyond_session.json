@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "note": "Ostatnia wypowiedź kończy się po 5000 s — przy sesji ~8 s lub 3600 s wywoła ostrzeżenie.",
+  "utterances": [
+    { "start_s": 1.0, "end_s": 3.0, "text": "Początek OK." },
+    { "start_s": 4980.0, "end_s": 5010.0, "text": "Koniec poza długością typowej sesji." }
+  ]
+}

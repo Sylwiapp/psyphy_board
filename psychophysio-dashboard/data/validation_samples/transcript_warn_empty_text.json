@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "utterances": [
+    { "start_s": 1.0, "end_s": 5.0, "text": "Normalna treść." },
+    { "start_s": 6.0, "end_s": 10.0, "text": "" },
+    { "start_s": 11.0, "end_s": 15.0, "text": "   " }
+  ]
+}

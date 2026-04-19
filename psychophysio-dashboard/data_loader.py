@@ -40,7 +40,15 @@ def _parse_vhdr(path: Path) -> BrainVisionMeta:
 
     resolutions: dict[int, float] = {}
     names: dict[int, str] = {}
+    # Tylko [Channel Infos] — w [Coordinates] są linie ChN=0,0,0 które inaczej nadpisują Resolution=0.
+    in_channel_infos = False
     for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_channel_infos = stripped.casefold() == "[channel infos]"
+            continue
+        if not in_channel_infos:
+            continue
         if line.startswith("Ch") and "=" in line and not line.startswith("Channels"):
             mm = re.match(r"Ch(\d+)=(.+)", line)
             if not mm:
@@ -97,9 +105,39 @@ def load_brainvision_auxiliary(vhdr_path: Path) -> tuple[pd.DataFrame | None, st
             meta,
         )
 
+    nbytes = eeg_path.stat().st_size
+    if nbytes == 0:
+        return (
+            None,
+            f"Plik `{eeg_path.name}` ma rozmiar 0 B — brak danych próbek. "
+            f"Sprawdź kopię z rekordera (pełna ścieżka: {eeg_path}).",
+            meta,
+        )
+
+    bytes_per_frame = 2 * meta.n_channels
+    if nbytes < bytes_per_frame:
+        return (
+            None,
+            f"Plik `{eeg_path.name}` jest za krótki ({nbytes} B) na jedną ramkę multiplex ({bytes_per_frame} B dla "
+            f"{meta.n_channels} kanałów × INT16).",
+            meta,
+        )
+    if nbytes % bytes_per_frame != 0:
+        return (
+            None,
+            f"Rozmiar `{eeg_path.name}` ({nbytes} B) nie jest wielokrotnością {bytes_per_frame} B "
+            f"(nagłówek mówi o {meta.n_channels} kanałach). Plik może być uszkodzony lub niekompletny.",
+            meta,
+        )
+
     data = _read_multiplexed_int16(eeg_path, meta.n_channels)
     if data.size == 0:
-        return None, "Plik .eeg jest pusty lub za krótki.", meta
+        return (
+            None,
+            f"Po odczycie `{eeg_path.name}` nie uzyskano żadnej pełnej próbki (plik: {nbytes} B). "
+            "Sprawdź zgodność `NumberOfChannels` w `.vhdr` z rzeczywistym plikiem `.eeg`.",
+            meta,
+        )
 
     n = data.shape[0]
     t = np.arange(n) / meta.sampling_hz
@@ -135,4 +173,5 @@ def load_brainvision_auxiliary(vhdr_path: Path) -> tuple[pd.DataFrame | None, st
 
 
 def find_vhdr_files(data_dir: Path) -> list[Path]:
-    return sorted(data_dir.glob("*.vhdr"))
+    """Wszystkie `.vhdr` w `data/` i podfolderach (np. `validation_samples/`)."""
+    return sorted(data_dir.glob("**/*.vhdr"))

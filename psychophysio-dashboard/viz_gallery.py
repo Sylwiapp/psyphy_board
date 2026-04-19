@@ -113,10 +113,17 @@ def fig_spectrogram(
     column: str,
     fs_hz: float,
     title: str,
+    max_input_samples: int = 400_000,
 ) -> go.Figure:
     """Spektrogram (STFT) — struktura częstotliwościowa w czasie; tu na oddechu lub ECG."""
-    x = df["time_s"].values
-    y = df[column].values
+    x = df["time_s"].values.astype(float, copy=False)
+    y = df[column].values.astype(float, copy=False)
+    n = len(y)
+    if n > max_input_samples:
+        step = int(np.ceil(n / max_input_samples))
+        x = x[::step]
+        y = y[::step]
+        fs_hz = float(fs_hz) / float(step)
     if len(y) < 256:
         y = np.pad(y, (0, 256 - len(y)))
     nperseg = min(512, max(128, len(y) // 40))

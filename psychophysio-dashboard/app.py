@@ -16,9 +16,19 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from transcript_io import Utterance, load_transcript_auto, load_transcript_json_bytes
-from data_loader import find_vhdr_files, load_brainvision_auxiliary
+from data_loader import BrainVisionMeta, find_vhdr_files, load_brainvision_auxiliary
+from data_validation import format_report_body, validate_brainvision_dataframe, validate_transcript
+from ecg_qc import (
+    EcgQcOptions,
+    compute_ecg_qc_report,
+    detect_r_peaks,
+    estimate_fs_from_time,
+    extract_ecg_series,
+    preprocess_visible,
+)
 import viz_gallery as vg
 
 APP_NAME = "PsyPhy Datalab"
@@ -195,7 +205,7 @@ def compute_view_x_range(
     """
     Tryby nawigacji po ciągłym czasie:
     - Pełna sesja — cała oś 0…3600 s
-    - Okno wokół kursora — przewijasz suwakiem (środek okna = kursor)
+    - Okno wokół kursora — środek okna = kursor (ustawiasz klikając punkt na wykresie Plotly)
     - Wybrany segment — stałe 10 min (segmenty 1–6)
     """
     if mode == NAV_FULL:
@@ -226,6 +236,54 @@ def min_max_norm(series: pd.Series | np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
+# Plotly + Streamlit serializują cały wykres do JSON — pełne nagranie 1 kHz (~4.5M pkt) przekracza domyślny limit (~200 MB).
+MAX_PLOT_POINTS_PER_TRACE = 20_000
+
+
+def envelope_downsample_pair(
+    t: np.ndarray,
+    y: np.ndarray,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Skrócenie szeregu do wykresu: koperty min/max w kubełkach czasu — zachowuje piki lepiej niż prosty stride."""
+    t = np.asarray(t, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = min(int(t.size), int(y.size))
+    if n <= 0:
+        return t[:0], y[:0]
+    t, y = t[:n], y[:n]
+    if n <= max_points or max_points < 4:
+        return t, y
+    n_buckets = max(1, max_points // 2)
+    edges = np.linspace(0, n, n_buckets + 1)
+    t_list: list[float] = []
+    y_list: list[float] = []
+    for b in range(n_buckets):
+        lo = int(edges[b])
+        hi = int(edges[b + 1])
+        if hi <= lo:
+            hi = min(lo + 1, n)
+        if lo >= n:
+            break
+        hi = min(hi, n)
+        idx = np.arange(lo, hi, dtype=int)
+        valid = np.isfinite(y[idx])
+        if not np.any(valid):
+            continue
+        idx = idx[valid]
+        ya = y[idx]
+        i_min = int(idx[int(np.argmin(ya))])
+        i_max = int(idx[int(np.argmax(ya))])
+        if i_min <= i_max:
+            seq = ((t[i_min], y[i_min]), (t[i_max], y[i_max]))
+        else:
+            seq = ((t[i_max], y[i_max]), (t[i_min], y[i_min]))
+        for tp, yp in seq:
+            t_list.append(float(tp))
+            y_list.append(float(yp))
+    return np.asarray(t_list, dtype=float), np.asarray(y_list, dtype=float)
+
+
 def fig_overlay_normalized(
     df: pd.DataFrame,
     cursor_s: float,
@@ -242,11 +300,14 @@ def fig_overlay_normalized(
         ("ecg_mv", "ECG (mV)", "#2ca02c"),
         ("eda_us", "EDA (µS)", "#d62728"),
     )
+    t_full = df["time_s"].to_numpy(dtype=float)
     for col, label, color in series_meta:
+        y_norm = min_max_norm(df[col])
+        tx, yp = envelope_downsample_pair(t_full, y_norm, MAX_PLOT_POINTS_PER_TRACE)
         fig.add_trace(
             go.Scatter(
-                x=df["time_s"],
-                y=min_max_norm(df[col]),
+                x=tx,
+                y=yp,
                 name=label,
                 mode="lines",
                 line=dict(width=1.1, color=color),
@@ -289,26 +350,20 @@ def fig_stacked(
         subplot_titles=stitles,
     )
     add_segment_shading(fig, rows, geom)
-    fig.add_trace(
-        go.Scatter(x=df["time_s"], y=df["oddech"], name="oddech", line=dict(width=0.8)),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=df["time_s"], y=df["puls_bpm"], name="puls", line=dict(width=0.8)),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=df["time_s"], y=df["ecg_mv"], name="ECG", line=dict(width=0.6)),
-        row=3,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=df["time_s"], y=df["eda_us"], name="EDA", line=dict(width=0.8)),
-        row=4,
-        col=1,
-    )
+    t_full = df["time_s"].to_numpy(dtype=float)
+    pairs = [
+        (df["oddech"].to_numpy(dtype=float), 1, "oddech", dict(width=0.8)),
+        (df["puls_bpm"].to_numpy(dtype=float), 2, "puls", dict(width=0.8)),
+        (df["ecg_mv"].to_numpy(dtype=float), 3, "ECG", dict(width=0.6)),
+        (df["eda_us"].to_numpy(dtype=float), 4, "EDA", dict(width=0.8)),
+    ]
+    for y_arr, row, name, line_kw in pairs:
+        tx, yy = envelope_downsample_pair(t_full, y_arr, MAX_PLOT_POINTS_PER_TRACE)
+        fig.add_trace(
+            go.Scatter(x=tx, y=yy, name=name, line=line_kw),
+            row=row,
+            col=1,
+        )
     add_cursor_vline(fig, cursor_s, rows)
     fig.update_layout(
         height=920,
@@ -322,27 +377,6 @@ def fig_stacked(
     return fig
 
 
-def sync_cursor_from_plotly(event: object | None, session_s: float) -> None:
-    """Ustawia kursor czasu po kliknięciu / zaznaczeniu punktu na wykresie Plotly (Streamlit on_select)."""
-    if event is None:
-        return
-    try:
-        sel = getattr(event, "selection", None)
-        if sel is None:
-            return
-        if isinstance(sel, dict):
-            pts = sel.get("points") or []
-        else:
-            pts = getattr(sel, "points", None) or []
-    except (TypeError, AttributeError):
-        return
-    if not pts:
-        return
-    p0 = pts[0]
-    x = float(p0["x"]) if isinstance(p0, dict) else float(getattr(p0, "x", 0))
-    st.session_state.cursor_s = float(np.clip(x, 0.0, session_s))
-
-
 def find_active_utterance(utterances: list[Utterance], cursor_s: float) -> Utterance | None:
     """Przedziały domknięte-otwarte [start, end)."""
     for u in utterances:
@@ -351,14 +385,14 @@ def find_active_utterance(utterances: list[Utterance], cursor_s: float) -> Utter
     return None
 
 
-def transcript_list_html(utterances: list[Utterance], cursor_s: float) -> str:
-    """
-    Lista wypowiedzi z podświetleniem — przez st.markdown (bez iframe),
-    więc przy każdej zmianie kursora Streamlit faktycznie odświeża HTML.
-    """
+def _transcript_utterance_blocks(utterances: list[Utterance], cursor_s: float) -> tuple[str, int]:
+    """HTML akapitów + indeks aktywnej wypowiedzi (-1 gdy kursor w przerwie)."""
     parts: list[str] = []
+    active_idx = -1
     for i, u in enumerate(utterances):
         is_active = u.start_s <= cursor_s < u.end_s
+        if is_active:
+            active_idx = i
         bg = "rgba(255,230,200,0.95)" if is_active else "rgba(255,255,255,0.92)"
         border = "2px solid #c44" if is_active else "1px solid #ccc"
         safe = html_module.escape(u.text)
@@ -368,11 +402,35 @@ def transcript_list_html(utterances: list[Utterance], cursor_s: float) -> str:
             f'<span style="color:#666;font-size:12px">[{u.start_s:.1f} – {u.end_s:.1f} s]</span><br/>{safe}</p>'
         )
     body = "\n".join(parts) if parts else "<p>(brak wypowiedzi)</p>"
-    return (
-        '<div style="max-height:420px;overflow-y:auto;padding:10px;background:#fafafa;'
-        'border:1px solid #ddd;border-radius:8px;font-family:system-ui,Segoe UI,sans-serif">'
+    return body, active_idx
+
+
+def transcript_iframe_html(utterances: list[Utterance], cursor_s: float) -> str:
+    """
+    Pełny dokument HTML w iframe: podświetlenie + przewinięcie do aktywnej wypowiedzi (scrollIntoView).
+    Przy każdej zmianie kursora Streamlit podmienia cały HTML — iframe się przeładowuje.
+    """
+    body, active_idx = _transcript_utterance_blocks(utterances, cursor_s)
+    scroll_js = ""
+    if active_idx >= 0:
+        scroll_js = f"""
+<script>
+document.addEventListener("DOMContentLoaded", function() {{
+  var el = document.getElementById("utt-{active_idx}");
+  if (el) el.scrollIntoView({{ block: "center", behavior: "auto" }});
+}});
+</script>
+"""
+    inner = (
+        f'<div id="tr-scroll" style="height:452px;overflow-y:auto;padding:10px;background:#fafafa;">'
         f"{body}</div>"
     )
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width"/></head>
+<body style="margin:0;font-family:system-ui,Segoe UI,sans-serif;">
+{inner}
+{scroll_js}
+</body></html>"""
 
 
 def main() -> None:
@@ -380,18 +438,18 @@ def main() -> None:
     st.title(APP_NAME)
     st.caption("Sesja z transkryptem i segmentami · prototyp open source")
 
-    st.markdown(
-        """
-**Dane:** tryb syntetyczny albo **BrainVision** (`.vhdr` + `.eeg` w folderze `data`) — kanały pomocnicze Resp / GSR / HR.  
-**Segmenty:** domyślnie **6** bloków o równej długości (długość sesji zależy od nagrania).  
-**Nawigacja:** pełna oś · **okno** wokół kursora · **jeden segment**.  
-**Nakładka (4 krzywe, min–max)** jest na górze zakładki Sesja; **klik** w punkt krzywej w Plotly ustawia kursor przy **kolejnym** odświeżeniu (standard Streamlit).  
-**Galeria:** histogramy, spektrogramy, korelacje, boxploty itd.  
-**Transkrypt:** JSON/CSV — podświetlenie wg czasu; przygotujemy import **kwestionariuszy** (CSV) osobno.
+#     st.markdown(
+#         """
+# **Dane:** tryb syntetyczny albo **BrainVision** (`.vhdr` + `.eeg` w folderze `data`) — kanały pomocnicze Resp / GSR / HR.  
+# **Segmenty:** domyślnie **6** bloków o równej długości (długość sesji zależy od nagrania).  
+# **Nawigacja:** pełna oś · **okno** wokół kursora · **jeden segment**.  
+# **Nakładka (4 krzywe, min–max)** jest na górze zakładki Sesja; **klik** w punkt krzywej w Plotly ustawia kursor przy **kolejnym** odświeżeniu (standard Streamlit).  
+# **Galeria:** histogramy, spektrogramy, korelacje, boxploty itd.  
+# **Transkrypt:** JSON/CSV — podświetlenie wg czasu; przygotujemy import **kwestionariuszy** (CSV) osobno.
 
-**Surowe vs przetworzone:** przegląd vs QC — oba widoki są w zakładkach obok siebie.
-        """
-    )
+# **Surowe vs przetworzone:** przegląd vs QC — oba widoki są w zakładkach obok siebie.
+#         """
+#     )
 
     if "cursor_s" not in st.session_state:
         st.session_state.cursor_s = 120.0
@@ -408,6 +466,7 @@ def main() -> None:
     raw_fs_hz = RAW_FS_HZ
     data_note = ""
     loaded_bv = False
+    meta_bv: BrainVisionMeta | None = None
     if src.startswith("Syntetyczne"):
         df_raw = make_physiology_raw(int(seed))
     else:
@@ -419,12 +478,20 @@ def main() -> None:
             pick = st.sidebar.selectbox("Nagranie", vhdrs, format_func=lambda p: p.name)
             df_bv, msg, meta = load_brainvision_auxiliary(pick)
             if df_bv is None:
-                st.warning(msg)
+                st.error(msg)
+                if meta is not None:
+                    eeg_path = pick.parent / meta.data_file
+                    if eeg_path.is_file():
+                        st.caption(f"Powiązany plik próbek: `{eeg_path.name}` — rozmiar na dysku: **{eeg_path.stat().st_size:,} B**.")
+                    else:
+                        st.caption(f"Oczekiwany plik próbek: `{eeg_path}` — nie znaleziono.")
+                st.caption("Używam danych **syntetycznych** do dalszego podglądu aplikacji.")
                 df_raw = make_physiology_raw(int(seed))
                 data_note = msg
             else:
                 df_raw = df_bv
                 loaded_bv = True
+                meta_bv = meta
                 raw_fs_hz = float(meta.sampling_hz) if meta else RAW_FS_HZ
                 st.success(msg)
                 data_note = "BrainVision: kanały Ch65–68 → oddech, tor oddechu 2, GSR (EDA), HR (µV)."
@@ -438,20 +505,51 @@ def main() -> None:
     st.sidebar.markdown("**Transkrypt**")
     use_upload = st.sidebar.checkbox("Wczytaj transkrypt z pliku (.json / .csv)", value=False)
     utterances: list[Utterance]
+    transcript_from_user_file = False
     if use_upload:
         up = st.sidebar.file_uploader("Plik JSON lub CSV", type=["json", "csv"])
         if up is not None:
             utterances = load_transcript_auto(up, up.name)
+            transcript_from_user_file = True
         else:
             utterances = make_synthetic_utterances(geom)
             st.sidebar.info("Brak pliku — używam syntetycznego transkryptu.")
     else:
         utterances = make_synthetic_utterances(geom)
 
+    merged_example_transcript = False
     if default_path.exists() and st.sidebar.checkbox("Dopisz przykład z `data/transcript.example.json`", value=False):
         raw = default_path.read_bytes()
         extra = load_transcript_json_bytes(raw)
         utterances = sorted(utterances + extra, key=lambda u: u.start_s)
+        merged_example_transcript = True
+
+    # --- walidacja jakości wczytanych plików (QC heurystyki, nie „certyfikat” laboratoryjny) ---
+    show_validation = (loaded_bv and meta_bv is not None) or transcript_from_user_file or merged_example_transcript
+    if show_validation:
+        with st.expander("Walidacja jakości wczytanych danych", expanded=bool(transcript_from_user_file or loaded_bv)):
+            st.caption(
+                "Automatyczne sprawdzenia: kompletność, typowa Fs, braki NaN, „płaskie” kanały, "
+                "spójność transkryptu z długością sesji. **Nie zastępują** opisu metody ani decyzji labu."
+            )
+            if loaded_bv and meta_bv is not None:
+                rep_bv = validate_brainvision_dataframe(df_raw, meta_bv, session_s=geom.session_s)
+                if rep_bv.has_error:
+                    st.error(rep_bv.summary_line())
+                elif rep_bv.has_warn:
+                    st.warning(rep_bv.summary_line())
+                else:
+                    st.success(rep_bv.summary_line())
+                st.markdown(format_report_body(rep_bv))
+            if transcript_from_user_file or merged_example_transcript:
+                rep_tr = validate_transcript(utterances, session_s=geom.session_s)
+                if rep_tr.has_error:
+                    st.error(rep_tr.summary_line())
+                elif rep_tr.has_warn:
+                    st.warning(rep_tr.summary_line())
+                else:
+                    st.success(rep_tr.summary_line())
+                st.markdown(format_report_body(rep_tr))
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Nawigacja po czasie**")
@@ -461,7 +559,7 @@ def main() -> None:
         index=0,
         help=(
             "Pełna sesja — cała godzina na osi (zoom/pan w Plotly). "
-            "Okno — oś pokazuje wycinek; środek okna = kursor (przesuwasz suwak = „przewijasz” dane). "
+            "Okno — oś pokazuje wycinek; środek okna = kursor (ustawiasz **klikając** punkt na krzywej w Plotly). "
             "Segment — stały blok 10 min (1–6)."
         ),
     )
@@ -475,7 +573,7 @@ def main() -> None:
                 value=120.0,
             )
         )
-        st.sidebar.caption("Przesuwaj **kursor czasu** — okno jest wyśrodkowane na kursorze.")
+        st.sidebar.caption("**Kliknij** punkt na krzywej (Plotly), aby ustawić kursor — okno jest wyśrodkowane na nim.")
     elif nav_mode == NAV_SEGMENT:
         seg_choice = st.sidebar.selectbox(
             "Segment",
@@ -493,7 +591,9 @@ def main() -> None:
             "na razie przygotuj pliki i ustal z promotorką kolumny."
         )
 
-    tab_session, tab_gallery = st.tabs(["Sesja i transkrypt", "Galeria wizualizacji (warianty)"])
+    tab_session, tab_gallery, tab_ecg_qc = st.tabs(
+        ["Sesja i transkrypt", "Galeria wizualizacji (warianty)", "QC / preprocessing — ECG"]
+    )
 
     with tab_session:
         _render_session_tab(
@@ -511,6 +611,192 @@ def main() -> None:
 
     with tab_gallery:
         _render_gallery_tab(df_raw, df_disp, raw_fs_hz)
+
+    with tab_ecg_qc:
+        _render_ecg_qc_tab(df_raw, df_disp, raw_fs_hz)
+
+
+def _render_ecg_qc_tab(
+    df_raw: pd.DataFrame,
+    df_disp: pd.DataFrame,
+    raw_fs_hz: float,
+) -> None:
+    """Zakładka: preprocess + QC toru ECG (`ecg_mv`) dla naukowca."""
+    st.subheader("QC / preprocessing — ECG (`ecg_mv`)")
+    st.caption(
+        "Tor w aplikacji jako **ecg_mv** (w BV często drugi pas oddechu — sprawdź nagłówek). "
+        "Wyniki to **heurystyka** do eksploracji; nie zastępują opisu metody w pracy."
+    )
+
+    src = st.radio(
+        "Źródło sygnału do analizy",
+        ["Surowe (zalecane do QC)", "Przetworzone (decymacja ~4 Hz)"],
+        horizontal=True,
+        key="ecg_qc_source",
+    )
+    df_use = df_raw if src.startswith("Surowe") else df_disp
+    fs_declared = float(raw_fs_hz) if src.startswith("Surowe") else float(DISPLAY_FS_HZ)
+
+    t_all, x_all = extract_ecg_series(df_use)
+    if t_all.size == 0:
+        st.warning("Brak kolumny `ecg_mv` w danych.")
+        return
+
+    fs_est = estimate_fs_from_time(t_all)
+    fs_use = float(st.number_input(
+        "Fs użyte w obliczeniach (Hz)",
+        min_value=0.5,
+        max_value=5000.0,
+        value=float(fs_declared if abs(fs_est - fs_declared) / max(fs_declared, 0.1) < 0.2 else fs_est),
+        step=0.5,
+        help="Domyślnie z nagłówka / trybu widoku; możesz nadpisać, jeśli znasz rzeczywiste Fs.",
+        key="ecg_qc_fs",
+    ))
+
+    with st.expander("Opcje preprocessingu (przed detekcją R)", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            use_bp = st.checkbox("Pasmoprzepustowy (Butterworth)", value=True, key="ecg_qc_bp")
+            detrend = st.checkbox("Detrend liniowy", value=True, key="ecg_qc_det")
+        with c2:
+            lo = st.slider("Dolne pasmo (Hz)", 0.5, 20.0, 5.0, 0.5, key="ecg_qc_lo")
+            hi = st.slider("Górne pasmo (Hz)", 5.0, 80.0, 40.0, 1.0, key="ecg_qc_hi")
+        with c3:
+            prom = st.slider("Czułość szczytów (wsp. prominence)", 0.1, 1.0, 0.35, 0.05, key="ecg_qc_prom")
+            dmin = st.slider("Min. odległość między R (s)", 0.2, 0.6, 0.28, 0.02, key="ecg_qc_dmin")
+
+    with st.expander("Progi akceptacji RR i okien czasu"):
+        c4, c5 = st.columns(2)
+        with c4:
+            rr_lo = st.number_input("RR min (ms)", 200.0, 800.0, 300.0, 10.0, key="ecg_qc_rrlo")
+            rr_hi = st.number_input("RR max (ms)", 800.0, 3000.0, 2000.0, 50.0, key="ecg_qc_rrhi")
+        with c5:
+            win_sec = st.number_input("Długość okna lokalnego (s)", 10.0, 300.0, 60.0, 10.0, key="ecg_qc_win")
+            flat_rel = float(
+                st.select_slider(
+                    "Próg „płaskiego” sygnału (std / amplituda)",
+                    options=[1e-8, 5e-8, 1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4],
+                    value=1e-5,
+                    format_func=lambda v: f"{v:.0e}",
+                    key="ecg_qc_flat",
+                )
+            )
+
+    lo_f, hi_f = float(lo), float(hi)
+    if hi_f <= lo_f:
+        hi_f = lo_f + 1.0
+    rr_a, rr_b = float(rr_lo), float(rr_hi)
+    if rr_b <= rr_a:
+        rr_b = rr_a + 50.0
+
+    opt = EcgQcOptions(
+        use_bandpass=use_bp,
+        bandpass_low_hz=lo_f,
+        bandpass_high_hz=hi_f,
+        detrend_linear=detrend,
+        r_peak_min_distance_s=float(dmin),
+        r_peak_prominence_factor=float(prom),
+        rr_min_ms=rr_a,
+        rr_max_ms=rr_b,
+        window_sec=float(win_sec),
+        flat_rel_std_max=float(flat_rel),
+    )
+
+    rep = compute_ecg_qc_report(t_all, x_all, fs_use, opt)
+    x_filt = preprocess_visible(x_all, fs_use, opt)
+    x_num = np.nan_to_num(
+        x_all,
+        nan=np.nanmedian(x_all[np.isfinite(x_all)]) if np.any(np.isfinite(x_all)) else 0.0,
+    )
+    peaks = detect_r_peaks(x_num, fs_use, opt) if t_all.size > 1 else np.array([], dtype=int)
+
+    st.markdown("---")
+    st.markdown("#### Podsumowanie jakości")
+    if rep.overall_label == "dobry":
+        st.success("**Ocena ogólna: dobry** — większość kryteriów spełniona.")
+    elif rep.overall_label == "slaby":
+        st.error("**Ocena ogólna: słaby** — warto poprawić zapis lub parametry.")
+    elif rep.overall_label == "ostroznie":
+        st.warning("**Ocena ogólna: ostrożnie** — sprawdź szczegóły i ewentualnie fragment ręcznie.")
+    else:
+        st.warning(f"**Ocena:** {rep.overall_label}")
+
+    c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+    c_m1.metric("Długość", f"{rep.duration_min:.1f} min")
+    c_m2.metric("Probek", f"{rep.n_samples:,}")
+    c_m3.metric("NaN", f"{rep.nan_fraction * 100:.2f} %")
+    c_m4.metric("Okna OK", f"{rep.window_ok_fraction * 100:.0f} % ({rep.n_windows_ok}/{rep.n_windows})")
+
+    c_m5, c_m6, c_m7, c_m8 = st.columns(4)
+    c_m5.metric("Wykryte R (heuryst.)", str(rep.n_peaks))
+    c_m6.metric("Mediana RR (ms)", f"{rep.median_rr_ms:.0f}" if rep.median_rr_ms else "—")
+    c_m7.metric("HR z med. RR (bpm)", f"{rep.mean_hr_bpm:.1f}" if rep.mean_hr_bpm else "—")
+    c_m8.metric("RR poza progiem", f"{rep.rr_outside_frac * 100:.1f} %")
+
+    st.caption(
+        f"**Clipping (heuryst.):** {rep.clip_fraction * 100:.3f} % próbek blisko |max|. "
+        f"**Płaski (całość):** {'tak' if rep.flat_signal else 'nie'}. "
+        f"**Fs w raporcie:** {rep.fs_hz:.2f} Hz."
+    )
+    for note in rep.notes:
+        st.caption(note)
+
+    preview_s = st.slider("Podgląd wykresu (początek sesji, s)", 3.0, 60.0, 15.0, 1.0, key="ecg_qc_preview")
+    m = t_all <= (float(t_all[0]) + preview_s)
+    t_sub, raw_sub, filt_sub = t_all[m], x_all[m], x_filt[m]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=t_sub, y=raw_sub, name="Surowy / wybrany", line=dict(width=0.8), opacity=0.7))
+    fig.add_trace(go.Scatter(x=t_sub, y=filt_sub, name="Po preprocessingu", line=dict(width=1.0)))
+    if peaks.size:
+        pk = peaks[t_all[peaks] <= (float(t_all[0]) + preview_s)]
+        if pk.size:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_all[pk],
+                    y=x_filt[pk],
+                    mode="markers",
+                    name="R (heuryst.)",
+                    marker=dict(size=8, color="red", symbol="x"),
+                )
+            )
+    fig.update_layout(
+        title=f"ECG — pierwsze ~{preview_s:.0f} s",
+        xaxis_title="Czas (s)",
+        yaxis_title="ecg_mv (jednostka z naglowka)",
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="ecg_qc_fig_ts")
+
+    if rep.rr_ms_list:
+        fig2 = go.Figure()
+        fig2.add_trace(
+            go.Histogram(x=rep.rr_ms_list, nbinsx=40, name="RR (ms)"),
+        )
+        fig2.add_vline(x=opt.rr_min_ms, line_dash="dash", line_color="gray")
+        fig2.add_vline(x=opt.rr_max_ms, line_dash="dash", line_color="gray")
+        fig2.update_layout(title="Rozkład odstępów RR", xaxis_title="RR (ms)", height=320)
+        st.plotly_chart(fig2, use_container_width=True, key="ecg_qc_fig_rr")
+
+    st.markdown("#### Interpretacja dla dalszej analizy")
+    usable = rep.window_ok_fraction * 100 if rep.n_windows else 0.0
+    if rep.overall_label == "dobry":
+        st.info(
+            f"Przy obecnych ustawieniach **~{usable:.0f} %** czasu w oknach {rep.window_sec:.0f} s wygląda na "
+            "nadający się do dalszej pracy (niski udział NaN, sygnał niepłaski w oknie). "
+            "Detekcja R służy orientacyjnie — przed HRV ustal ostateczny pipeline z promotorką."
+        )
+    elif rep.overall_label == "slaby":
+        st.warning(
+            "Znaczna część nagrania może wymagać odrzucenia lub innego preprocessingu. "
+            "Sprawdź elektrody, ruch, saturację; rozważ inne Fs lub pasmo."
+        )
+    elif rep.overall_label == "ostroznie":
+        st.info(
+            "Część nagrania nadaje się do analizy, część — nie. Użyj wykresu i histogramu RR; "
+            "możesz zawęzić progi RR lub okno lokalne i odświeżyć stronę."
+        )
 
 
 def _render_session_tab(
@@ -535,14 +821,43 @@ def _render_session_tab(
     if loaded_bv and data_note:
         st.caption(data_note)
 
+    cursor_s = float(st.session_state.cursor_s)
+
+    x_range = compute_view_x_range(nav_mode, cursor_s, window_s, segment_index, geom)
+
+    st.subheader("Nakładka: 4 kanały (min–max)")
+    st.caption(
+        "Wszystkie sygnały na **jednej** osi Y po normalizacji min–max (porównanie kształtu). "
+        "Czas ustawiasz **suwakiem** bezpośrednio pod wykresem."
+    )
+    overlay_src = st.radio(
+        "Źródło nakładki",
+        ["Przetworzone", "Surowe"],
+        horizontal=True,
+        key="overlay_top_src",
+    )
+    df_ov = df_disp if overlay_src == "Przetworzone" else df_raw
+    if len(df_ov) > MAX_PLOT_POINTS_PER_TRACE:
+        st.caption(
+            f"Nakładka: do wykresu użyto **do {MAX_PLOT_POINTS_PER_TRACE:,} punktów na tor** (koperta min/max w czasie)."
+        )
+    suf = "przetworzone" if overlay_src == "Przetworzone" else "surowe"
+    hz = DISPLAY_FS_HZ if overlay_src == "Przetworzone" else raw_fs_hz
+    st.plotly_chart(
+        fig_overlay_normalized(df_ov, cursor_s, f"{suf} (~{hz:.0f} Hz)", x_range, geom),
+        use_container_width=True,
+    )
+
+    st.caption("**Kursor czasu** — przesuń suwak, aby przesunąć czerwoną linię na wykresach i w transkrypcie.")
     cursor_s = st.slider(
         "Kursor czasu (s)",
         min_value=0.0,
         max_value=float(geom.session_s),
         value=float(st.session_state.cursor_s),
         step=1.0,
-        help="Transkrypt i pionowa linia. Klik w wykresie Plotly (tryb zaznaczania punktów) ustawia czas przy następnym odświeżeniu.",
+        help="Pionowa linia na osi czasu i podświetlenie transkryptu.",
         key="cursor_slider_main",
+        label_visibility="collapsed",
     )
     st.session_state.cursor_s = float(cursor_s)
 
@@ -556,30 +871,8 @@ def _render_session_tab(
         )
     )
 
-    st.subheader("Nakładka: 4 kanały (min–max)")
-    st.caption(
-        "Wszystkie sygnały na **jednej** osi Y po normalizacji min–max (porównanie kształtu). "
-        "Wybierz źródło, potem **kliknij punkt na krzywej** (Plotly), aby ustawić kursor."
-    )
-    overlay_src = st.radio(
-        "Źródło nakładki",
-        ["Przetworzone", "Surowe"],
-        horizontal=True,
-        key="overlay_top_src",
-    )
-    df_ov = df_disp if overlay_src == "Przetworzone" else df_raw
-    suf = "przetworzone" if overlay_src == "Przetworzone" else "surowe"
-    hz = DISPLAY_FS_HZ if overlay_src == "Przetworzone" else raw_fs_hz
-    ev_ov = st.plotly_chart(
-        fig_overlay_normalized(df_ov, cursor_s, f"{suf} (~{hz:.0f} Hz)", x_range, geom),
-        use_container_width=True,
-        on_select="rerun",
-        selection_mode="points",
-        key="overlay_main_pick",
-    )
-    sync_cursor_from_plotly(ev_ov, geom.session_s)
-
     st.markdown("**Legenda tła:** paski = kolejne segmenty sesji. **Czerwona linia** = kursor czasu.")
+
     col_plots, col_tr = st.columns([1.65, 1.0], gap="large")
 
     with col_plots:
@@ -595,7 +888,12 @@ def _render_session_tab(
                 f"Surowe dane ~{raw_fs_hz:.0f} Hz — użyj zoomu w Plotly. "
                 + ("Kanały z BrainVision." if loaded_bv else "Syntetyczne ECG.")
             )
-            ev_r = st.plotly_chart(
+            if len(df_raw) > MAX_PLOT_POINTS_PER_TRACE:
+                st.caption(
+                    f"Wykres pokazuje **{MAX_PLOT_POINTS_PER_TRACE:,} punktów na kanał** (decymacja kopertą min/max), "
+                    "żeby nie przekroczyć limitu rozmiaru wiadomości Streamlit — kształt sesji zostaje czytelny."
+                )
+            st.plotly_chart(
                 fig_stacked(
                     df_raw,
                     cursor_s,
@@ -605,17 +903,13 @@ def _render_session_tab(
                     subplot_titles=stitles,
                 ),
                 use_container_width=True,
-                on_select="rerun",
-                selection_mode="points",
-                key="plot_raw_click",
             )
-            sync_cursor_from_plotly(ev_r, geom.session_s)
 
         with tab_filt:
             st.caption(
                 f"Wygładzenie + decymacja ~{DISPLAY_FS_HZ:.0f} Hz — przegląd całości."
             )
-            ev_f = st.plotly_chart(
+            st.plotly_chart(
                 fig_stacked(
                     df_disp,
                     cursor_s,
@@ -625,26 +919,25 @@ def _render_session_tab(
                     subplot_titles=stitles,
                 ),
                 use_container_width=True,
-                on_select="rerun",
-                selection_mode="points",
-                key="plot_disp_click",
             )
-            sync_cursor_from_plotly(ev_f, geom.session_s)
 
     cursor_s = float(st.session_state.cursor_s)
 
     with col_tr:
         st.subheader("Transkrypt")
-        st.caption(f"Kursor: **{cursor_s:.1f} s** — poniżej podświetlona jest wypowiedź obejmująca ten moment.")
+        st.caption(
+            f"Kursor: **{cursor_s:.1f} s** — poniżej podświetlona jest wypowiedź obejmująca ten moment; "
+            "lista **przewija się** do niej przy zmianie kursora."
+        )
         active = find_active_utterance(utterances, cursor_s)
         if active:
             st.info(f"**{active.start_s:.1f} – {active.end_s:.1f} s** · {active.text}")
         else:
             st.caption(
                 "W tym momencie nie ma wypowiedzi (przerwa między frazami albo cisza w segmencie). "
-                "Przesuń kursor lub kliknij wykres."
+                "Przesuń suwak pod wykresem nakładki, aby wybrać inny moment."
             )
-        st.markdown(transcript_list_html(utterances, cursor_s), unsafe_allow_html=True)
+        components.html(transcript_iframe_html(utterances, cursor_s), height=480, scrolling=False)
 
     with st.expander("Format plików transkryptu (uniwersalny)"):
         st.markdown(

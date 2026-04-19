@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "utterances": [
+    { "start_s": 10.0, "end_s": 25.0, "text": "Długi pierwszy segment." },
+    { "start_s": 20.0, "end_s": 35.0, "text": "Nakłada się z poprzednim (20–25 s)." },
+    { "start_s": 100.0, "end_s": 110.0, "text": "Osobny blok bez nakładania." }
+  ]
+}

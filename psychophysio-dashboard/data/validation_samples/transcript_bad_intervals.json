@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "utterances": [
+    { "start_s": 10.0, "end_s": 5.0, "text": "BŁĄD: koniec przed startem." },
+    { "start_s": 20.0, "end_s": 20.0, "text": "BŁĄD: zerowa długość (end == start)." },
+    { "start_s": 30.0, "end_s": 40.0, "text": "Ta linia jest poprawna — ale powyższe psują raport." }
+  ]
+}
