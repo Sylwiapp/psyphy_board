@@ -8,7 +8,6 @@ Uruchomienie: py -3 -m streamlit run app.py
 from __future__ import annotations
 
 import html as html_module
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -19,15 +18,26 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from transcript_io import Utterance, load_transcript_auto, load_transcript_json_bytes
+from bv_markers import new_segment_times_seconds, parse_vmrk, resolve_vmrk_path
 from data_loader import BrainVisionMeta, find_vhdr_files, load_brainvision_auxiliary
+from calm_triggers import build_calm_analysis_geom, load_calm_trigger_times
+from session_geom import SessionGeom, session_geom_equal_split, session_geom_from_marker_starts
 from data_validation import format_report_body, validate_brainvision_dataframe, validate_transcript
 from ecg_qc import (
+    CLEAN_METHODS,
+    NK_AVAILABLE,
+    NK_VERSION,
+    PEAK_METHODS,
     EcgQcOptions,
+    apply_manual_edits,
+    clean_ecg,
     compute_ecg_qc_report,
+    compute_hrv_metrics,
     detect_r_peaks,
     estimate_fs_from_time,
     extract_ecg_series,
-    preprocess_visible,
+    parse_times_input,
+    signal_quality,
 )
 import viz_gallery as vg
 
@@ -42,17 +52,6 @@ NAV_SEGMENT = "Wybrany segment"
 DEFAULT_SESSION_S = 60 * 60
 N_SEG_DEFAULT = 6
 
-
-@dataclass(frozen=True)
-class SessionGeom:
-    """Długość nagrania i podział na segmenty (np. 6 bloków po ~10 min)."""
-
-    session_s: float
-    n_seg: int = N_SEG_DEFAULT
-
-    @property
-    def seg_len_s(self) -> float:
-        return self.session_s / max(self.n_seg, 1)
 
 # „Surowe”: wyższa częstotliwość (symulacja); „przetworzone”: wygładzenie + rzadsze próbki
 RAW_FS_HZ = 25.0
@@ -120,9 +119,9 @@ def make_synthetic_utterances(geom: SessionGeom) -> list[Utterance]:
         "Krótsza wypowiedź.",
         "Tu może być Twój transkrypt z alignmentem.",
     )
-    sl = geom.seg_len_s
     for seg_i in range(geom.n_seg):
-        base = seg_i * sl
+        base, seg_end = geom.segment_bounds(seg_i)
+        sl = seg_end - base
         if seg_i in (1, 3, 5):
             # segmenty „bez pełnej mowy” — rzadkie krótkie linie
             for k in range(3):
@@ -142,8 +141,7 @@ def make_synthetic_utterances(geom: SessionGeom) -> list[Utterance]:
 
 def add_segment_shading(fig: go.Figure, rows: int, geom: SessionGeom) -> None:
     for i in range(geom.n_seg):
-        x0 = i * geom.seg_len_s
-        x1 = min((i + 1) * geom.seg_len_s, geom.session_s)
+        x0, x1 = geom.segment_bounds(i)
         for r in range(1, rows + 1):
             fig.add_vrect(
                 x0=x0,
@@ -170,8 +168,7 @@ def add_cursor_vline(fig: go.Figure, cursor_s: float, rows: int) -> None:
 def add_segment_shading_single(fig: go.Figure, geom: SessionGeom) -> None:
     """Pasma segmentów na jednym panelu (nakładka)."""
     for i in range(geom.n_seg):
-        x0 = i * geom.seg_len_s
-        x1 = min((i + 1) * geom.seg_len_s, geom.session_s)
+        x0, x1 = geom.segment_bounds(i)
         fig.add_vrect(
             x0=x0,
             x1=x1,
@@ -206,7 +203,7 @@ def compute_view_x_range(
     Tryby nawigacji po ciągłym czasie:
     - Pełna sesja — cała oś 0…3600 s
     - Okno wokół kursora — środek okna = kursor (ustawiasz klikając punkt na wykresie Plotly)
-    - Wybrany segment — stałe 10 min (segmenty 1–6)
+    - Wybrany segment — zakres jednego bloku: CALM z logu triggerów, New Segment w .vmrk, albo równe bloki
     """
     if mode == NAV_FULL:
         return (0.0, float(geom.session_s))
@@ -214,8 +211,8 @@ def compute_view_x_range(
         half = max(1.0, window_s / 2.0)
         return clamp_window(cursor_s, half, geom.session_s)
     if mode == NAV_SEGMENT:
-        s = float(segment_index * geom.seg_len_s)
-        return (s, min(s + geom.seg_len_s, geom.session_s))
+        lo, hi = geom.segment_bounds(segment_index)
+        return (float(lo), float(hi))
     return (0.0, float(geom.session_s))
 
 
@@ -467,6 +464,7 @@ def main() -> None:
     data_note = ""
     loaded_bv = False
     meta_bv: BrainVisionMeta | None = None
+    pick_vhdr: Path | None = None
     if src.startswith("Syntetyczne"):
         df_raw = make_physiology_raw(int(seed))
     else:
@@ -475,12 +473,12 @@ def main() -> None:
             st.sidebar.warning("Brak pliku `.vhdr` w `data`. Używam danych syntetycznych.")
             df_raw = make_physiology_raw(int(seed))
         else:
-            pick = st.sidebar.selectbox("Nagranie", vhdrs, format_func=lambda p: p.name)
-            df_bv, msg, meta = load_brainvision_auxiliary(pick)
+            pick_vhdr = st.sidebar.selectbox("Nagranie", vhdrs, format_func=lambda p: p.name)
+            df_bv, msg, meta = load_brainvision_auxiliary(pick_vhdr)
             if df_bv is None:
                 st.error(msg)
                 if meta is not None:
-                    eeg_path = pick.parent / meta.data_file
+                    eeg_path = pick_vhdr.parent / meta.data_file
                     if eeg_path.is_file():
                         st.caption(f"Powiązany plik próbek: `{eeg_path.name}` — rozmiar na dysku: **{eeg_path.stat().st_size:,} B**.")
                     else:
@@ -493,10 +491,69 @@ def main() -> None:
                 loaded_bv = True
                 meta_bv = meta
                 raw_fs_hz = float(meta.sampling_hz) if meta else RAW_FS_HZ
-                st.success(msg)
-                data_note = "BrainVision: kanały Ch65–68 → oddech, tor oddechu 2, GSR (EDA), HR (µV)."
+                st.success(msg.split("\n\n")[0])
+                if "\n\n" in msg:
+                    st.markdown(msg.split("\n\n", 1)[1])
+                data_note = msg
 
-    geom = SessionGeom(session_s=max(float(df_raw["time_s"].max()), 1.0), n_seg=N_SEG_DEFAULT)
+    session_s = max(float(df_raw["time_s"].max()), 1.0)
+    geom = session_geom_equal_split(session_s, N_SEG_DEFAULT)
+    segment_layout_caption = (
+        f"Segmenty: **{geom.n_seg}** równych bloków czasu (brak pliku `.vmrk` lub brak markerów **New Segment**)."
+    )
+    calm_from_log = False
+    if loaded_bv and pick_vhdr is not None:
+        tlogs = sorted(pick_vhdr.parent.glob("*triggers*.log"))
+        chosen_trigger: Path | None = None
+        if len(tlogs) == 1:
+            chosen_trigger = tlogs[0]
+        elif len(tlogs) > 1:
+            chosen_trigger = st.sidebar.selectbox(
+                "Log triggerów CALM (`*triggers*.log`)",
+                options=tlogs,
+                format_func=lambda p: p.name,
+                key="calm_trigger_log_pick",
+            )
+        if chosen_trigger is not None:
+            try:
+                code_times = load_calm_trigger_times(chosen_trigger)
+                calm_geom = build_calm_analysis_geom(session_s, code_times)
+                if calm_geom is not None:
+                    geom = calm_geom
+                    calm_from_log = True
+                    segment_layout_caption = (
+                        f"Segmenty: **{geom.n_seg}** przedziałów analizy **CALM** z `{chosen_trigger.name}` "
+                        f"(czas względem triggera **1**; pary kodów w `calm_triggers.py`)."
+                    )
+                else:
+                    st.sidebar.warning(
+                        f"W logu `{chosen_trigger.name}` brakuje kompletnych par kodów CALM — "
+                        "używam **.vmrk** / **New Segment** albo równych bloków."
+                    )
+            except Exception as exc:  # noqa: BLE001 — komunikat dla użytkownika Streamlit
+                st.sidebar.warning(
+                    f"Nie wczytano logu triggerów `{chosen_trigger.name}`: {exc}"
+                )
+
+    if not calm_from_log and loaded_bv and meta_bv is not None and pick_vhdr is not None:
+        vmrk_path = resolve_vmrk_path(pick_vhdr, meta_bv.marker_file)
+        if vmrk_path is not None:
+            markers = parse_vmrk(vmrk_path)
+            if any(m.mk_type.casefold() == "new segment" for m in markers):
+                starts_s = new_segment_times_seconds(markers, raw_fs_hz)
+                geom_marker = session_geom_from_marker_starts(session_s, starts_s)
+                if geom_marker.n_seg > 1:
+                    geom = geom_marker
+                    segment_layout_caption = (
+                        f"Segmenty: **{geom.n_seg}** bloków wg markerów **New Segment** w `{vmrk_path.name}` "
+                        f"(czas z pozycji próbek, Fs = {raw_fs_hz:.1f} Hz)."
+                    )
+                else:
+                    geom = session_geom_equal_split(session_s, N_SEG_DEFAULT)
+                    segment_layout_caption = (
+                        f"Segmenty: **{geom.n_seg}** równych bloków — w `{vmrk_path.name}` markery **New Segment** "
+                        f"dają tylko **jeden** odcinek całej sesji; użyto podziału jak przy danych **syntetycznych**."
+                    )
     st.session_state.cursor_s = float(np.clip(st.session_state.cursor_s, 0.0, geom.session_s))
 
     df_disp = to_display(df_raw, raw_fs_hz)
@@ -552,15 +609,17 @@ def main() -> None:
                 st.markdown(format_report_body(rep_tr))
 
     st.sidebar.markdown("---")
+    st.sidebar.caption(segment_layout_caption)
     st.sidebar.markdown("**Nawigacja po czasie**")
     nav_mode = st.sidebar.radio(
         "Tryb widoku osi X",
         [NAV_FULL, NAV_WINDOW, NAV_SEGMENT],
         index=0,
         help=(
-            "Pełna sesja — cała godzina na osi (zoom/pan w Plotly). "
-            "Okno — oś pokazuje wycinek; środek okna = kursor (ustawiasz **klikając** punkt na krzywej w Plotly). "
-            "Segment — stały blok 10 min (1–6)."
+            "Pełna sesja — cała oś czasu (zoom/pan w Plotly). "
+            "Okno — wycinek wokół kursora (ustawiasz **klikając** punkt na krzywej). "
+            "Wybrany segment — jeden przedział: z logu **CALM** (`*triggers*.log`), "
+            "markerów **New Segment** w `.vmrk` albo równy podział czasu."
         ),
     )
     window_s = 120.0
@@ -578,7 +637,10 @@ def main() -> None:
         seg_choice = st.sidebar.selectbox(
             "Segment",
             list(range(1, geom.n_seg + 1)),
-            format_func=lambda i: f"{i} (blok {i}/{geom.n_seg})",
+            format_func=lambda num: (
+                f"{num}/{geom.n_seg} · {geom.segment_label(num - 1)} · "
+                f"{geom.segment_bounds(num - 1)[0]:.0f}–{geom.segment_bounds(num - 1)[1]:.0f} s"
+            ),
         )
         segment_index = int(seg_choice) - 1
 
@@ -610,66 +672,217 @@ def main() -> None:
         )
 
     with tab_gallery:
-        _render_gallery_tab(df_raw, df_disp, raw_fs_hz)
+        _render_gallery_tab(df_raw, df_disp, raw_fs_hz, geom)
 
     with tab_ecg_qc:
-        _render_ecg_qc_tab(df_raw, df_disp, raw_fs_hz)
+        ecg_src = (
+            str(pick_vhdr.resolve())
+            if loaded_bv and pick_vhdr is not None
+            else f"synth_{seed}"
+        )
+        _render_ecg_qc_tab(df_raw, df_disp, raw_fs_hz, ecg_data_source_key=ecg_src)
+
+
+ECG_PRESETS: dict[str, dict[str, object]] = {
+    "NeuroKit (default, HRV-friendly)": {
+        "clean": "neurokit",
+        "peak": "neurokit",
+        "correct": True,
+        "powerline": 50.0,
+        "desc": (
+            "Domyślny pipeline NK2: HP 0.5 Hz + powerline notch, detekcja R z NK2 "
+            "(`neurokit`), korekcja artefaktów RR metodą Lipponen–Tarvainen 2019."
+        ),
+    },
+    "Pan-Tompkins 1985 (klasyczna detekcja QRS)": {
+        "clean": "pantompkins1985",
+        "peak": "pantompkins1985",
+        "correct": True,
+        "powerline": 50.0,
+        "desc": "BP 5–15 Hz, klasyczny detektor R z 1985 r. Korekcja RR włączona.",
+    },
+    "Hamilton 2002": {
+        "clean": "hamilton2002",
+        "peak": "hamilton2002",
+        "correct": True,
+        "powerline": 50.0,
+        "desc": "Modyfikacja Pan-Tompkins z adaptacyjnymi progami.",
+    },
+    "Elgendi 2010 (szybki / mobilny)": {
+        "clean": "elgendi2010",
+        "peak": "elgendi2010",
+        "correct": True,
+        "powerline": 50.0,
+        "desc": "Dwa kroczące okna; lekki obliczeniowo, dobry dla wearables.",
+    },
+}
+
+ECG_DEFAULT_PRESET = "NeuroKit (default, HRV-friendly)"
+
+
+def _apply_ecg_preset() -> None:
+    """Callback: po zmianie presetu prefilluje wartości widgetów preprocessingu."""
+    name = st.session_state.get("ecg_qc_preset", ECG_DEFAULT_PRESET)
+    if name not in ECG_PRESETS:
+        return
+    p = ECG_PRESETS[name]
+    st.session_state["ecg_qc_clean_method"] = str(p["clean"])
+    st.session_state["ecg_qc_peak_method"] = str(p["peak"])
+    st.session_state["ecg_qc_fix"] = bool(p["correct"])
+    st.session_state["ecg_qc_powerline"] = float(p["powerline"])
 
 
 def _render_ecg_qc_tab(
     df_raw: pd.DataFrame,
     df_disp: pd.DataFrame,
     raw_fs_hz: float,
+    ecg_data_source_key: str = "demo",
 ) -> None:
-    """Zakładka: preprocess + QC toru ECG (`ecg_mv`) dla naukowca."""
+    """Zakładka: preprocess + QC toru ECG (`ecg_mv`) z użyciem NeuroKit2."""
     st.subheader("QC / preprocessing — ECG (`ecg_mv`)")
     st.caption(
         "Tor w aplikacji jako **ecg_mv** (w BV często drugi pas oddechu — sprawdź nagłówek). "
-        "Wyniki to **heurystyka** do eksploracji; nie zastępują opisu metody w pracy."
+        "Cały pipeline opiera się na **NeuroKit2** (czyszczenie, detekcja R, korekcja artefaktów "
+        "Lipponen–Tarvainen 2019). Wyniki służą eksploracji i przygotowaniu danych — opis "
+        "metody w pracy układaj wg Quigley 2024 / Laborde 2017."
     )
 
-    src = st.radio(
-        "Źródło sygnału do analizy",
-        ["Surowe (zalecane do QC)", "Przetworzone (decymacja ~4 Hz)"],
-        horizontal=True,
-        key="ecg_qc_source",
-    )
-    df_use = df_raw if src.startswith("Surowe") else df_disp
-    fs_declared = float(raw_fs_hz) if src.startswith("Surowe") else float(DISPLAY_FS_HZ)
+    if not NK_AVAILABLE:
+        st.error(
+            "NeuroKit2 nie jest zainstalowany — uruchom `py -3 -m pip install neurokit2`, "
+            "a następnie odśwież aplikację. Bez NK2 detekcja R nie zadziała."
+        )
+    else:
+        st.caption(f"NeuroKit2 v{NK_VERSION} · pip pakiet `neurokit2`.")
 
-    t_all, x_all = extract_ecg_series(df_use)
+    st.caption(
+        "Analiza zawsze działa na **surowym** sygnale (`df_raw`) — wersja przetworzona w innych "
+        "zakładkach to decymacja do ~4 Hz, która jest poniżej Nyquista dla QRS i czyni detekcję "
+        "R niemożliwą. Quigley 2024 zaleca **≥ 250 Hz** (najlepiej 1000 Hz)."
+    )
+
+    t_all, x_all = extract_ecg_series(df_raw)
     if t_all.size == 0:
         st.warning("Brak kolumny `ecg_mv` w danych.")
         return
 
     fs_est = estimate_fs_from_time(t_all)
-    fs_use = float(st.number_input(
-        "Fs użyte w obliczeniach (Hz)",
-        min_value=0.5,
-        max_value=5000.0,
-        value=float(fs_declared if abs(fs_est - fs_declared) / max(fs_declared, 0.1) < 0.2 else fs_est),
-        step=0.5,
-        help="Domyślnie z nagłówka / trybu widoku; możesz nadpisać, jeśli znasz rzeczywiste Fs.",
-        key="ecg_qc_fs",
-    ))
+    # Dla BV (Fs z nagłówka zwykle ≥250 Hz) zawsze ufamy nagłówkowi — błędna mediana kroków
+    # w time_s (np. po imporcie) nie może zejść z 1000 Hz na 25 Hz i psuć całego NK2.
+    if raw_fs_hz >= 250:
+        fs_default = float(raw_fs_hz)
+        if fs_est > 0 and abs(fs_est - raw_fs_hz) / max(raw_fs_hz, 1.0) > 0.15:
+            st.warning(
+                f"**Rozbieżność Fs:** z kolumny `time_s` wychodzi ok. **{fs_est:.0f} Hz**, "
+                f"a nagłówek / meta nagrania to **{raw_fs_hz:.0f} Hz**. "
+                "Pole **Fs** domyślnie ustawione jest na **wartość z nagłówka** (wymagane dla "
+                "NeuroKit przy pełnej liczbie próbek). Jeśli ten plik jest świadomie przedecymowany "
+                "do innej Fs, zmień wartość ręcznie."
+            )
+    else:
+        fs_default = float(
+            raw_fs_hz
+            if abs(fs_est - raw_fs_hz) / max(raw_fs_hz, 0.1) < 0.2
+            else fs_est
+        )
 
-    with st.expander("Opcje preprocessingu (przed detekcją R)", expanded=True):
-        c1, c2, c3 = st.columns(3)
+    fs_use = float(
+        st.number_input(
+            "Fs użyte w obliczeniach (Hz)",
+            min_value=0.5,
+            max_value=5000.0,
+            value=fs_default,
+            step=0.5,
+            help=(
+                "Dla BrainVision domyślnie **Fs z nagłówka** (.vhdr). **Quigley et al. 2024** zaleca "
+                "**1000 Hz** (±1 ms dokładności R). Ustawienie Fs **niższego** niż rzeczywiste "
+                "próbkowanie psuje filtry i detekcję R w NeuroKit, a RR z osi `time_s` może "
+                "wyglądać spójnie — nie daj się zwieść."
+            ),
+            key=f"ecg_qc_fs__{ecg_data_source_key}",
+        )
+    )
+
+    for k, default in (
+        ("ecg_qc_preset", ECG_DEFAULT_PRESET),
+        ("ecg_qc_clean_method", str(ECG_PRESETS[ECG_DEFAULT_PRESET]["clean"])),
+        ("ecg_qc_peak_method", str(ECG_PRESETS[ECG_DEFAULT_PRESET]["peak"])),
+        ("ecg_qc_fix", bool(ECG_PRESETS[ECG_DEFAULT_PRESET]["correct"])),
+        ("ecg_qc_powerline", float(ECG_PRESETS[ECG_DEFAULT_PRESET]["powerline"])),
+    ):
+        st.session_state.setdefault(k, default)
+
+    st.selectbox(
+        "Preset preprocessingu",
+        options=list(ECG_PRESETS.keys()),
+        key="ecg_qc_preset",
+        on_change=_apply_ecg_preset,
+        help=(
+            "Wybór presetu **wpisuje** wartości w pola poniżej. Możesz potem zmienić "
+            "dowolne pole ręcznie — preset nie blokuje nadpisywania."
+        ),
+    )
+    preset_now = ECG_PRESETS[st.session_state["ecg_qc_preset"]]
+    st.caption(f"**{st.session_state['ecg_qc_preset']}** — {preset_now['desc']}")
+
+    with st.expander("Opcje preprocessingu (NeuroKit2)", expanded=True):
+        c1, c2 = st.columns(2)
         with c1:
-            use_bp = st.checkbox("Pasmoprzepustowy (Butterworth)", value=True, key="ecg_qc_bp")
-            detrend = st.checkbox("Detrend liniowy", value=True, key="ecg_qc_det")
+            st.selectbox(
+                "Metoda czyszczenia (`nk.ecg_clean`)",
+                options=list(CLEAN_METHODS),
+                key="ecg_qc_clean_method",
+                help=(
+                    "`neurokit`: HP 0.5 Hz + powerline notch (default NK2). "
+                    "`pantompkins1985`: BP 5–15 Hz. `hamilton2002`, `elgendi2010`: "
+                    "warianty filtrów + integratorów. `biosppy`: pipeline BioSPPy. "
+                    "`none`: brak czyszczenia."
+                ),
+            )
         with c2:
-            lo = st.slider("Dolne pasmo (Hz)", 0.5, 20.0, 5.0, 0.5, key="ecg_qc_lo")
-            hi = st.slider("Górne pasmo (Hz)", 5.0, 80.0, 40.0, 1.0, key="ecg_qc_hi")
+            st.selectbox(
+                "Metoda detekcji R (`nk.ecg_peaks`)",
+                options=list(PEAK_METHODS),
+                key="ecg_qc_peak_method",
+                help=(
+                    "`neurokit` (default), klasyczne: `pantompkins1985`, `hamilton2002`, "
+                    "`elgendi2010`, `engzeemod2012`, `kalidas2017` (deep-learning), "
+                    "`rodrigues2021`. `promac` — agregat wielu detektorów."
+                ),
+            )
+
+        c3, c4 = st.columns(2)
         with c3:
-            prom = st.slider("Czułość szczytów (wsp. prominence)", 0.1, 1.0, 0.35, 0.05, key="ecg_qc_prom")
-            dmin = st.slider("Min. odległość między R (s)", 0.2, 0.6, 0.28, 0.02, key="ecg_qc_dmin")
+            st.checkbox(
+                "Korekcja artefaktów RR (Lipponen–Tarvainen 2019, „Kubios” w NK2)",
+                key="ecg_qc_fix",
+                help=(
+                    "Klasyfikator i poprawki RR: ectopic / missed / extra / longshort. "
+                    "Zalecane przy nagraniach z ruchem; wyłącz, gdy chcesz „surowe” piki NK2."
+                ),
+            )
+        with c4:
+            st.radio(
+                "Powerline notch (tylko `clean = neurokit`)",
+                options=[50.0, 60.0],
+                horizontal=True,
+                key="ecg_qc_powerline",
+                help="Częstotliwość sieci: 50 Hz w UE/PL, 60 Hz w US.",
+            )
 
     with st.expander("Progi akceptacji RR i okien czasu"):
         c4, c5 = st.columns(2)
         with c4:
-            rr_lo = st.number_input("RR min (ms)", 200.0, 800.0, 300.0, 10.0, key="ecg_qc_rrlo")
-            rr_hi = st.number_input("RR max (ms)", 800.0, 3000.0, 2000.0, 50.0, key="ecg_qc_rrhi")
+            rr_lo = st.number_input(
+                "RR min (ms)", 200.0, 800.0, 300.0, 10.0,
+                key="ecg_qc_rrlo",
+                help="HR_max ≈ 200 bpm → 300 ms; w protokołach z wysiłkiem rozważ niższy próg.",
+            )
+            rr_hi = st.number_input(
+                "RR max (ms)", 800.0, 3000.0, 2000.0, 50.0,
+                key="ecg_qc_rrhi",
+                help="HR_min ≈ 30 bpm → 2000 ms; w spoczynku zwykle <1500 ms.",
+            )
         with c5:
             win_sec = st.number_input("Długość okna lokalnego (s)", 10.0, 300.0, 60.0, 10.0, key="ecg_qc_win")
             flat_rel = float(
@@ -682,33 +895,101 @@ def _render_ecg_qc_tab(
                 )
             )
 
-    lo_f, hi_f = float(lo), float(hi)
-    if hi_f <= lo_f:
-        hi_f = lo_f + 1.0
     rr_a, rr_b = float(rr_lo), float(rr_hi)
     if rr_b <= rr_a:
         rr_b = rr_a + 50.0
 
     opt = EcgQcOptions(
-        use_bandpass=use_bp,
-        bandpass_low_hz=lo_f,
-        bandpass_high_hz=hi_f,
-        detrend_linear=detrend,
-        r_peak_min_distance_s=float(dmin),
-        r_peak_prominence_factor=float(prom),
+        clean_method=str(st.session_state["ecg_qc_clean_method"]),
+        peak_method=str(st.session_state["ecg_qc_peak_method"]),
+        correct_artifacts=bool(st.session_state["ecg_qc_fix"]),
+        powerline_hz=float(st.session_state["ecg_qc_powerline"]),
         rr_min_ms=rr_a,
         rr_max_ms=rr_b,
         window_sec=float(win_sec),
         flat_rel_std_max=float(flat_rel),
     )
 
-    rep = compute_ecg_qc_report(t_all, x_all, fs_use, opt)
-    x_filt = preprocess_visible(x_all, fs_use, opt)
-    x_num = np.nan_to_num(
-        x_all,
-        nan=np.nanmedian(x_all[np.isfinite(x_all)]) if np.any(np.isfinite(x_all)) else 0.0,
+    with st.spinner("NeuroKit2: czyszczenie ECG i detekcja R…"):
+        x_filt = clean_ecg(x_all, fs_use, opt)
+        rp = detect_r_peaks(x_filt, fs_use, opt)
+        quality = signal_quality(x_filt, rp.peaks, fs_use)
+
+    peaks_auto = rp.peaks
+
+    if st.session_state.get("ecg_manual_clear_pending"):
+        st.session_state["ecg_manual_add_text"] = ""
+        st.session_state["ecg_manual_remove_text"] = ""
+        st.session_state["ecg_manual_clear_pending"] = False
+
+    with st.expander(
+        "Ręczna edycja R-peaków (zaawansowane)",
+        expanded=bool(
+            st.session_state.get("ecg_manual_add_text")
+            or st.session_state.get("ecg_manual_remove_text")
+        ),
+    ):
+        st.caption(
+            "Znajdź problematyczny pik w **„Podgląd sygnału i R-peaków”** poniżej (najedź "
+            "kursorem — Plotly pokaże czas w sekundach), a następnie wpisz tu jego czas. "
+            "Usuwanie snapuje do najbliższego wykrytego piku w tolerancji **±50 ms** "
+            "(Quigley 2024 zaleca preferować wizualną korektę nad samym automatem)."
+        )
+        cma, cmb, cmc = st.columns([2, 2, 1])
+        with cma:
+            add_text = st.text_area(
+                "Dodaj R przy (s)",
+                placeholder="np. 12.34, 13.92, 18.01",
+                key="ecg_manual_add_text",
+                height=80,
+            )
+        with cmb:
+            rm_text = st.text_area(
+                "Usuń R przy (s)",
+                placeholder="np. 7.50, 21.10",
+                key="ecg_manual_remove_text",
+                height=80,
+            )
+        with cmc:
+            st.write(" ")
+            if st.button("Wyczyść edycje", key="ecg_manual_clear"):
+                st.session_state["ecg_manual_clear_pending"] = True
+                st.rerun()
+
+    add_times = parse_times_input(st.session_state.get("ecg_manual_add_text", ""))
+    rm_times = parse_times_input(st.session_state.get("ecg_manual_remove_text", ""))
+    peaks, n_added, n_removed = apply_manual_edits(
+        peaks_auto, fs_use, add_times, rm_times
     )
-    peaks = detect_r_peaks(x_num, fs_use, opt) if t_all.size > 1 else np.array([], dtype=int)
+    if n_added or n_removed:
+        st.info(
+            f"Ręczna edycja zastosowana: **+{n_added}** dodanych, "
+            f"**-{n_removed}** usuniętych względem auto-detekcji."
+        )
+
+    rep = compute_ecg_qc_report(
+        t_all,
+        x_all,
+        fs_use,
+        opt,
+        peaks_idx=peaks,
+        n_corrections=rp.n_corrections,
+        mean_quality=quality,
+        n_manual_added=n_added,
+        n_manual_removed=n_removed,
+    )
+
+    # Spodziewana rzędu wielkości liczba R przy HR 30–200 bpm (konservatywnie 25 bpm).
+    min_peaks_expected = max(30, int(rep.duration_min * 25))
+    if rep.n_peaks < min_peaks_expected:
+        st.error(
+            f"Wykryto tylko **{rep.n_peaks}** R-peaków w sesji **~{rep.duration_min:.1f} min** — "
+            f"dla sensownego ECG oczekuje się co najmniej ok. **{min_peaks_expected}+** pików "
+            f"(HR ok. 25–200 bpm). To **nie** jest problem domyślnego presetu NeuroKit, notch "
+            "50/60 Hz ani progów RR 300–2000 ms: algorytm prawie nie widzi QRS w tym torze. "
+            "Sprawdź w BrainVision, czy **`ecg_mv` to rzeczywiście ECG** (często drugi pas to oddech), "
+            "ew. inny kanał w `.vhdr`."
+        )
 
     st.markdown("---")
     st.markdown("#### Podsumowanie jakości")
@@ -717,85 +998,512 @@ def _render_ecg_qc_tab(
     elif rep.overall_label == "slaby":
         st.error("**Ocena ogólna: słaby** — warto poprawić zapis lub parametry.")
     elif rep.overall_label == "ostroznie":
-        st.warning("**Ocena ogólna: ostrożnie** — sprawdź szczegóły i ewentualnie fragment ręcznie.")
+        st.warning(
+            "**Ocena ogólna: ostrożnie** — sprawdź szczegóły i ewentualnie fragment ręcznie."
+        )
     else:
         st.warning(f"**Ocena:** {rep.overall_label}")
 
     c_m1, c_m2, c_m3, c_m4 = st.columns(4)
     c_m1.metric("Długość", f"{rep.duration_min:.1f} min")
-    c_m2.metric("Probek", f"{rep.n_samples:,}")
+    c_m2.metric("Próbek", f"{rep.n_samples:,}")
     c_m3.metric("NaN", f"{rep.nan_fraction * 100:.2f} %")
-    c_m4.metric("Okna OK", f"{rep.window_ok_fraction * 100:.0f} % ({rep.n_windows_ok}/{rep.n_windows})")
+    c_m4.metric(
+        "Okna OK",
+        f"{rep.window_ok_fraction * 100:.0f} % ({rep.n_windows_ok}/{rep.n_windows})",
+    )
 
     c_m5, c_m6, c_m7, c_m8 = st.columns(4)
-    c_m5.metric("Wykryte R (heuryst.)", str(rep.n_peaks))
-    c_m6.metric("Mediana RR (ms)", f"{rep.median_rr_ms:.0f}" if rep.median_rr_ms else "—")
-    c_m7.metric("HR z med. RR (bpm)", f"{rep.mean_hr_bpm:.1f}" if rep.mean_hr_bpm else "—")
+    c_m5.metric("Wykryte R (po edycji)", str(rep.n_peaks))
+    c_m6.metric(
+        "Mediana RR (ms)",
+        f"{rep.median_rr_ms:.0f}" if rep.median_rr_ms else "—",
+    )
+    c_m7.metric(
+        "HR z med. RR (bpm)",
+        f"{rep.mean_hr_bpm:.1f}" if rep.mean_hr_bpm else "—",
+    )
     c_m8.metric("RR poza progiem", f"{rep.rr_outside_frac * 100:.1f} %")
 
+    c_m9, c_m10, c_m11, c_m12 = st.columns(4)
+    c_m9.metric(
+        "Jakość NK2 (0–1)",
+        f"{rep.mean_quality:.2f}" if rep.mean_quality is not None else "—",
+        help="Średnia z `nk.ecg_quality` (1 = wzorzec szablonu QRS).",
+    )
+    c_m10.metric("Korekty RR (auto)", str(rp.n_corrections))
+    c_m11.metric("Dodane ręcznie", str(rep.n_manual_added))
+    c_m12.metric("Usunięte ręcznie", str(rep.n_manual_removed))
+
     st.caption(
-        f"**Clipping (heuryst.):** {rep.clip_fraction * 100:.3f} % próbek blisko |max|. "
+        f"**Clipping:** {rep.clip_fraction * 100:.3f} % próbek blisko |max|. "
         f"**Płaski (całość):** {'tak' if rep.flat_signal else 'nie'}. "
         f"**Fs w raporcie:** {rep.fs_hz:.2f} Hz."
     )
     for note in rep.notes:
         st.caption(note)
 
-    preview_s = st.slider("Podgląd wykresu (początek sesji, s)", 3.0, 60.0, 15.0, 1.0, key="ecg_qc_preview")
-    m = t_all <= (float(t_all[0]) + preview_s)
+    st.markdown("#### Jak dużo nagrania jest „do użycia” wg aplikacji?")
+    st.caption(
+        "**Ocena ogólna** i **RR poza progiem** patrzą na całą sesję naraz. **Okna OK** "
+        "dzielą nagranie na kawałki po długości z pola „Długość okna lokalnego” i w każdym "
+        "sprawdzają: NaN, czy sygnał nie jest płaski oraz czy RR w tym fragmencie nie wygląda "
+        "jak lawina błędów. To bliższe odpowiedzi na pytanie „które minuty odrzucić”."
+    )
+    if rep.n_windows > 0:
+        usable_pct = rep.window_ok_fraction * 100.0
+        st.info(
+            f"**Orientacyjnie możesz traktować jako „nadające się” ~{usable_pct:.0f} %** czasu "
+            f"trwania nagrania (**{rep.n_windows_ok}** z **{rep.n_windows}** okien po "
+            f"**{rep.window_sec:.0f} s**). Reszta — do ręcznej weryfikacji albo wykluczenia z HRV. "
+            "To nie zastępuje decyzji metodologicznej w pracy."
+        )
+    else:
+        st.warning(
+            "Nie policzono mapy okien (sesja krótsza niż połowa wybranego okna albo brak danych). "
+            "Skróć „Długość okna lokalnego” albo sprawdź Fs i kolumnę `ecg_mv`."
+        )
+
+    st.markdown("#### Mapa jakości w czasie")
+    st.caption(
+        "**Zielony** = okno spełnia kryteria lokalne. **Szary** = co najmniej jeden problem "
+        "(powód w tabeli poniżej). Te same szare pasy są nałożone na **Podgląd sygnału** dalej."
+    )
+    if rep.window_segments:
+        t_min = float(t_all[0])
+        t_max = float(t_all[-1])
+        fig_map = go.Figure()
+        for ws in rep.window_segments:
+            fillcolor = (
+                "rgba(45, 180, 90, 0.38)" if ws.ok else "rgba(95, 95, 95, 0.48)"
+            )
+            fig_map.add_shape(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=ws.t_start_s,
+                x1=ws.t_end_s,
+                y0=0.0,
+                y1=1.0,
+                fillcolor=fillcolor,
+                line_width=0,
+                layer="below",
+            )
+        fig_map.update_xaxes(
+            title_text="Czas (s)",
+            range=[t_min, t_max],
+            constrain="range",
+        )
+        fig_map.update_yaxes(visible=False, range=[0, 1])
+        fig_map.update_layout(
+            height=110,
+            margin=dict(l=50, r=20, t=28, b=45),
+            title=dict(
+                text="Zielone = OK · Szare = problem (szczegóły w tabeli)",
+                font=dict(size=13),
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_map, use_container_width=True, key="ecg_qc_fig_qmap")
+
+        tbl = []
+        for ws in rep.window_segments:
+            tbl.append(
+                {
+                    "od (s)": round(ws.t_start_s, 1),
+                    "do (s)": round(ws.t_end_s, 1),
+                    "OK": "tak" if ws.ok else "nie",
+                    "powód (heurystyka)": " · ".join(ws.reasons_pl)
+                    if ws.reasons_pl
+                    else "—",
+                    "NaN %": round(ws.nan_fraction * 100, 2),
+                    "płaski": "tak" if ws.flat_window else "nie",
+                    "R w oknie": ws.n_peaks_in_window,
+                    "RR poza % (w oknie)": (
+                        "—"
+                        if ws.rr_outside_frac_window is None
+                        else f"{ws.rr_outside_frac_window * 100:.1f}"
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(tbl),
+            use_container_width=True,
+            height=min(420, 36 + 28 * len(tbl)),
+        )
+    else:
+        st.caption("Brak segmentów do mapy — patrz wyżej.")
+
+    if rp.n_corrections > 0 or rp.peaks_uncorrected.size != rp.peaks.size:
+        with st.expander(
+            f"Co zrobił automat (korekcja RR — Lipponen–Tarvainen 2019): "
+            f"{rp.n_corrections} zmian",
+            expanded=False,
+        ):
+            st.caption(
+                "Typy korekt z algorytmu **Kubios / LT19**. Indeksy odnoszą się do "
+                "**oryginalnej** (nieskorygowanej) listy R-peaków:\n"
+                "- **ectopic** — uderzenie ektopowe: pozycja R została poprawiona,\n"
+                "- **missed** — automat dodał brakujący R,\n"
+                "- **extra** — automat usunął zbędny R,\n"
+                "- **longshort** — para „długi-krótki” odstęp RR poprawiona."
+            )
+            n_ect = int(rp.fixes_ectopic.size)
+            n_mis = int(rp.fixes_missed.size)
+            n_xtr = int(rp.fixes_extra.size)
+            n_ls = int(rp.fixes_longshort.size)
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("Ectopic", str(n_ect))
+            cc2.metric("Missed", str(n_mis))
+            cc3.metric("Extra", str(n_xtr))
+            cc4.metric("Long-short", str(n_ls))
+
+            rows: list[dict[str, object]] = []
+            t_arr = np.asarray(t_all, dtype=float)
+            uncorr = rp.peaks_uncorrected
+            for label, arr in (
+                ("ectopic", rp.fixes_ectopic),
+                ("missed", rp.fixes_missed),
+                ("extra", rp.fixes_extra),
+                ("longshort", rp.fixes_longshort),
+            ):
+                for i in arr.tolist():
+                    if 0 <= int(i) < uncorr.size:
+                        s_idx = int(uncorr[int(i)])
+                        if 0 <= s_idx < t_arr.size:
+                            rows.append(
+                                {
+                                    "typ": label,
+                                    "indeks R (uncorr.)": int(i),
+                                    "czas (s)": float(t_arr[s_idx]),
+                                }
+                            )
+            if rows:
+                df_fix = pd.DataFrame(rows).sort_values("czas (s)").reset_index(
+                    drop=True
+                )
+                df_fix["czas (s)"] = df_fix["czas (s)"].round(2)
+                st.dataframe(df_fix, use_container_width=True, height=240)
+                st.caption(
+                    "Skopiuj „czas (s)” do pól ręcznej edycji powyżej, jeśli chcesz "
+                    "ten konkretny pik dodatkowo skorygować lub usunąć."
+                )
+
+    with st.expander("Metryki HRV (NeuroKit2)", expanded=False):
+        if not NK_AVAILABLE:
+            st.info("NeuroKit2 niedostępny.")
+        elif rep.n_peaks < 4:
+            st.info("Za mało pików (< 4) — dodaj/popraw R i odśwież.")
+        else:
+            with st.spinner("Liczę HRV (czas + częstotliwość)…"):
+                hrv_df = compute_hrv_metrics(peaks, fs_use)
+            if hrv_df.empty:
+                st.info("NK2 nie zwrócił metryk (nagranie zbyt krótkie?).")
+            else:
+                main_cols = [
+                    c
+                    for c in (
+                        "HRV_MeanNN",
+                        "HRV_SDNN",
+                        "HRV_RMSSD",
+                        "HRV_pNN50",
+                        "HRV_LF",
+                        "HRV_HF",
+                        "HRV_LFHF",
+                    )
+                    if c in hrv_df.columns
+                ]
+                if main_cols:
+                    st.dataframe(
+                        hrv_df[main_cols].T.rename(columns={0: "wartość"}),
+                        use_container_width=True,
+                    )
+                st.caption("Pełen zestaw (NK2 `hrv_time` + `hrv_frequency`):")
+                st.dataframe(
+                    hrv_df.T.rename(columns={0: "wartość"}),
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Laborde 2017: do tonu wagalnego preferować **RMSSD** lub **HF**; "
+                    "unikać `LF/HF` jako miary „balansu”. Pasma: HF 0.15–0.40 Hz, "
+                    "LF 0.04–0.15 Hz, VLF 0.0033–0.04 Hz (Task Force 1996)."
+                )
+
+    st.markdown("#### Podgląd sygnału i R-peaków")
+    duration_total = float(t_all[-1] - t_all[0]) if t_all.size > 1 else 1.0
+    max_preview = min(120.0, max(3.0, duration_total))
+    c_pa, c_pb = st.columns([2, 1])
+    with c_pa:
+        preview_s = float(
+            st.slider(
+                "Szerokość okna (s)",
+                3.0,
+                float(max_preview),
+                float(min(15.0, max_preview)),
+                1.0,
+                key="ecg_qc_preview",
+            )
+        )
+    with c_pb:
+        start_s = float(
+            st.number_input(
+                "Start okna (s)",
+                0.0,
+                max(0.0, duration_total - 1.0),
+                0.0,
+                1.0,
+                key="ecg_qc_preview_start",
+                help="Przesuwaj okno po sesji, aby zlokalizować błędne R-peaki.",
+            )
+        )
+    t0 = float(t_all[0]) + start_s
+    t1 = t0 + preview_s
+    m = (t_all >= t0) & (t_all <= t1)
     t_sub, raw_sub, filt_sub = t_all[m], x_all[m], x_filt[m]
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t_sub, y=raw_sub, name="Surowy / wybrany", line=dict(width=0.8), opacity=0.7))
-    fig.add_trace(go.Scatter(x=t_sub, y=filt_sub, name="Po preprocessingu", line=dict(width=1.0)))
-    if peaks.size:
-        pk = peaks[t_all[peaks] <= (float(t_all[0]) + preview_s)]
-        if pk.size:
+    st.caption(
+        "Górny panel — **surowy** sygnał z BrainVision (DC offset i drift widoczne). "
+        f"Dolny panel — sygnał **po `nk.ecg_clean('{opt.clean_method}')`**: "
+        "filtr i usunięcie wędrowania linii bazowej, dzięki czemu R-peaki są dobrze "
+        "widoczne i szczyty mają porównywalną amplitudę. Detekcja R wykonywana jest "
+        "na sygnale dolnego panelu."
+    )
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=("Surowy ECG", f"Po NK2 ({opt.clean_method})"),
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=t_sub,
+            y=raw_sub,
+            name="Surowy",
+            line=dict(width=0.8, color="#888"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=t_sub,
+            y=filt_sub,
+            name="Po NK2",
+            line=dict(width=1.1, color="#1f77b4"),
+        ),
+        row=2,
+        col=1,
+    )
+
+    uncorr = rp.peaks_uncorrected
+    if uncorr.size:
+        m_unc = (t_all[uncorr] >= t0) & (t_all[uncorr] <= t1)
+        pk_u = uncorr[m_unc]
+        if pk_u.size:
             fig.add_trace(
                 go.Scatter(
-                    x=t_all[pk],
-                    y=x_filt[pk],
+                    x=t_all[pk_u],
+                    y=x_filt[pk_u],
                     mode="markers",
-                    name="R (heuryst.)",
-                    marker=dict(size=8, color="red", symbol="x"),
-                )
+                    name=f"R przed korekcją ({opt.peak_method})",
+                    marker=dict(size=7, color="#9aa", symbol="circle-open"),
+                    hovertemplate="t=%{x:.3f}s<br>amp=%{y:.3g}<extra></extra>",
+                ),
+                row=2,
+                col=1,
             )
+    if peaks_auto.size and rp.n_corrections > 0:
+        m_a = (t_all[peaks_auto] >= t0) & (t_all[peaks_auto] <= t1)
+        pk_a = peaks_auto[m_a]
+        if pk_a.size:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_all[pk_a],
+                    y=x_filt[pk_a],
+                    mode="markers",
+                    name="R po korekcji RR (LT19)",
+                    marker=dict(size=9, color="red", symbol="x"),
+                    hovertemplate="t=%{x:.3f}s<br>amp=%{y:.3g}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+    elif peaks_auto.size:
+        m_a = (t_all[peaks_auto] >= t0) & (t_all[peaks_auto] <= t1)
+        pk_a = peaks_auto[m_a]
+        if pk_a.size:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_all[pk_a],
+                    y=x_filt[pk_a],
+                    mode="markers",
+                    name=f"R auto ({opt.peak_method})",
+                    marker=dict(size=8, color="red", symbol="x"),
+                    hovertemplate="t=%{x:.3f}s<br>amp=%{y:.3g}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+    if peaks.size and (n_added or n_removed):
+        m_f = (t_all[peaks] >= t0) & (t_all[peaks] <= t1)
+        pk_f = peaks[m_f]
+        if pk_f.size:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_all[pk_f],
+                    y=x_filt[pk_f],
+                    mode="markers",
+                    name="R po ręcznej edycji",
+                    marker=dict(size=11, color="#2ca02c", symbol="circle-open"),
+                    hovertemplate="t=%{x:.3f}s<br>amp=%{y:.3g}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+
+    for ws in rep.window_segments:
+        if ws.ok:
+            continue
+        lo = max(ws.t_start_s, t0)
+        hi = min(ws.t_end_s, t1)
+        if hi <= lo:
+            continue
+        for row in (1, 2):
+            fig.add_vrect(
+                x0=lo,
+                x1=hi,
+                fillcolor="rgba(90, 90, 90, 0.18)",
+                line_width=0,
+                layer="below",
+                row=row,
+                col=1,
+            )
+
     fig.update_layout(
-        title=f"ECG — pierwsze ~{preview_s:.0f} s",
-        xaxis_title="Czas (s)",
-        yaxis_title="ecg_mv (jednostka z naglowka)",
-        height=420,
+        title=f"ECG · okno {start_s:.0f}–{start_s + preview_s:.0f} s",
+        height=520,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
+    fig.update_yaxes(title_text="Surowy (jedn. z nagłówka)", row=1, col=1)
+    fig.update_yaxes(title_text="Po NK2", row=2, col=1)
+    fig.update_xaxes(title_text="Czas (s)", row=2, col=1)
     st.plotly_chart(fig, use_container_width=True, key="ecg_qc_fig_ts")
-
-    if rep.rr_ms_list:
-        fig2 = go.Figure()
-        fig2.add_trace(
-            go.Histogram(x=rep.rr_ms_list, nbinsx=40, name="RR (ms)"),
+    if rep.window_segments and any(not ws.ok for ws in rep.window_segments):
+        st.caption(
+            "**Szare pasy** — fragmenty, które w mapie jakości (okna po "
+            f"**{rep.window_sec:.0f} s**) dostały status „nie OK”; powody są w tabeli pod mapą."
         )
-        fig2.add_vline(x=opt.rr_min_ms, line_dash="dash", line_color="gray")
-        fig2.add_vline(x=opt.rr_max_ms, line_dash="dash", line_color="gray")
-        fig2.update_layout(title="Rozkład odstępów RR", xaxis_title="RR (ms)", height=320)
-        st.plotly_chart(fig2, use_container_width=True, key="ecg_qc_fig_rr")
+
+    if peaks.size >= 2:
+        peak_times_s = t_all[peaks].astype(float)
+        rr_ms = np.diff(peak_times_s) * 1000.0
+        rr_times = peak_times_s[1:]
+        out_mask = (rr_ms < opt.rr_min_ms) | (rr_ms > opt.rr_max_ms)
+
+        st.markdown("#### Tachogram (RR w czasie)")
+        st.caption(
+            "Każdy punkt = jeden odstęp R-R w milisekundach, ustawiony w czasie "
+            "**drugiego** uderzenia. Pomaga zlokalizować artefakty czasowo (nie tylko "
+            "policzyć je): pojedyncze „skoki” to zwykle błędne piki, plateau → realna "
+            "zmiana HR (np. mowa, ruch). Czerwone punkty leżą poza progami "
+            f"{opt.rr_min_ms:g}–{opt.rr_max_ms:g} ms."
+        )
+        fig_t = go.Figure()
+        fig_t.add_trace(
+            go.Scatter(
+                x=rr_times,
+                y=rr_ms,
+                mode="lines+markers",
+                name="RR (ms)",
+                line=dict(width=1, color="#1f77b4"),
+                marker=dict(size=4),
+                hovertemplate=(
+                    "t=%{x:.2f}s<br>RR=%{y:.0f} ms<br>HR=%{customdata:.1f} bpm<extra></extra>"
+                ),
+                customdata=60000.0 / np.where(rr_ms > 0, rr_ms, np.nan),
+            )
+        )
+        if out_mask.any():
+            fig_t.add_trace(
+                go.Scatter(
+                    x=rr_times[out_mask],
+                    y=rr_ms[out_mask],
+                    mode="markers",
+                    name="Poza progiem",
+                    marker=dict(size=9, color="red", symbol="x"),
+                    hovertemplate="t=%{x:.2f}s<br>RR=%{y:.0f} ms<extra></extra>",
+                )
+            )
+        fig_t.add_hline(
+            y=opt.rr_min_ms, line_dash="dash", line_color="gray", opacity=0.6
+        )
+        fig_t.add_hline(
+            y=opt.rr_max_ms, line_dash="dash", line_color="gray", opacity=0.6
+        )
+        fig_t.update_yaxes(title_text="RR (ms)", tickformat="d")
+        fig_t.update_xaxes(title_text="Czas (s)")
+        fig_t.update_layout(height=320, legend=dict(orientation="h", y=1.02))
+        st.plotly_chart(fig_t, use_container_width=True, key="ecg_qc_fig_tacho")
+
+        with st.expander("Histogram odstępów RR (rozkład)", expanded=False):
+            st.caption(
+                "Rozkład wszystkich odstępów R-R. Oś **X w milisekundach** "
+                "(typowo 600–1000 ms dla 60–100 bpm). Bimodalność / długi ogon "
+                "sugeruje artefakty albo dwa różne stany HR w sesji."
+            )
+            fig_h = go.Figure()
+            fig_h.add_trace(
+                go.Histogram(
+                    x=rr_ms, nbinsx=40, name="RR (ms)", marker_color="#1f77b4"
+                )
+            )
+            fig_h.add_vline(x=opt.rr_min_ms, line_dash="dash", line_color="gray")
+            fig_h.add_vline(x=opt.rr_max_ms, line_dash="dash", line_color="gray")
+            fig_h.update_xaxes(title_text="RR (ms)", tickformat="d")
+            fig_h.update_yaxes(title_text="Liczba odstępów", tickformat="d")
+            fig_h.update_layout(height=300, bargap=0.05)
+            st.plotly_chart(fig_h, use_container_width=True, key="ecg_qc_fig_rr")
+
+    with st.expander("Referencje (cytuj w metodzie)"):
+        st.markdown(
+            """
+- **Makowski, D. et al. (2021).** *NeuroKit2: A Python toolbox for neurophysiological signal processing.* Behav. Res. Methods, 53, 1689–1696.
+  [doi:10.3758/s13428-020-01516-y](https://doi.org/10.3758/s13428-020-01516-y) — biblioteka użyta jako engine (`ecg_clean`, `ecg_peaks`, `ecg_quality`, `hrv_time`, `hrv_frequency`).
+- **Lipponen, J. A., & Tarvainen, M. P. (2019).** *A robust algorithm for HRV time series artefact correction.* J. Med. Eng. Technol., 43(3), 173–181.
+  [doi:10.1080/03091902.2019.1640306](https://doi.org/10.1080/03091902.2019.1640306) — algorytm korekcji artefaktów RR (`correct_artifacts=True`, NK2 method `Kubios`).
+- **Pan, J., & Tompkins, W. J. (1985).** *A real-time QRS detection algorithm.* IEEE TBME, 32(3), 230–236.
+  [doi:10.1109/TBME.1985.325532](https://doi.org/10.1109/TBME.1985.325532) — preset `pantompkins1985` (BP 5–15 Hz + refractory 200 ms).
+- **Hamilton, P. (2002).** *Open Source ECG Analysis Software.* Comput. Cardiol., 29, 101–104. — preset `hamilton2002`.
+- **Elgendi, M. et al. (2010).** *Frequency Bands Effects on QRS Detection.* BIOSIGNALS — preset `elgendi2010`.
+- **Quigley, K. S. et al. (2024).** *Publication guidelines for human heart rate and HRV studies in psychophysiology — Part 1.* Psychophysiology, 61, e14604.
+  [doi:10.1111/psyp.14604](https://doi.org/10.1111/psyp.14604) — Fs 1000 Hz, korekcja > usuwanie epok, wizualna inspekcja R.
+- **Laborde, S., Mosley, E., & Thayer, J. F. (2017).** *HRV and Cardiac Vagal Tone in Psychophysiological Research — Recommendations.* Frontiers in Psychology, 8, 213.
+  [doi:10.3389/fpsyg.2017.00213](https://doi.org/10.3389/fpsyg.2017.00213) — RMSSD/HF preferowane nad LF/HF; 500–1000 Hz; struktura *3R*.
+- **Task Force ESC/NASPE (1996).** *Heart rate variability: standards of measurement.* Circulation, 93(5), 1043–1065.
+  [doi:10.1161/01.CIR.93.5.1043](https://doi.org/10.1161/01.CIR.93.5.1043) — pasma VLF/LF/HF, 5-min standard.
+            """
+        )
 
     st.markdown("#### Interpretacja dla dalszej analizy")
     usable = rep.window_ok_fraction * 100 if rep.n_windows else 0.0
     if rep.overall_label == "dobry":
         st.info(
-            f"Przy obecnych ustawieniach **~{usable:.0f} %** czasu w oknach {rep.window_sec:.0f} s wygląda na "
-            "nadający się do dalszej pracy (niski udział NaN, sygnał niepłaski w oknie). "
-            "Detekcja R służy orientacyjnie — przed HRV ustal ostateczny pipeline z promotorką."
+            f"~**{usable:.0f} %** czasu w oknach {rep.window_sec:.0f} s spełnia kryteria. "
+            "Pipeline NK2 + LT19 jest gotowy do dalszej analizy HRV — przed publikacją "
+            "udokumentuj wersję NK2, metody i % korekt RR (Quintana et al. 2016)."
         )
     elif rep.overall_label == "slaby":
         st.warning(
             "Znaczna część nagrania może wymagać odrzucenia lub innego preprocessingu. "
-            "Sprawdź elektrody, ruch, saturację; rozważ inne Fs lub pasmo."
+            "Sprawdź elektrody, ruch, saturację; rozważ inny preset (np. `pantompkins1985` "
+            "przy silnym wędrowaniu) lub Fs."
         )
     elif rep.overall_label == "ostroznie":
         st.info(
-            "Część nagrania nadaje się do analizy, część — nie. Użyj wykresu i histogramu RR; "
-            "możesz zawęzić progi RR lub okno lokalne i odświeżyć stronę."
+            "Część nagrania nadaje się, część — nie. Skorzystaj z okna podglądu (powyżej) "
+            "i pól ręcznej edycji, aby poprawić R-peaki w problematycznych fragmentach."
         )
 
 
@@ -862,16 +1570,23 @@ def _render_session_tab(
     st.session_state.cursor_s = float(cursor_s)
 
     x_range = compute_view_x_range(nav_mode, cursor_s, window_s, segment_index, geom)
+    seg_hint = ""
+    if nav_mode == NAV_SEGMENT:
+        lo, hi = geom.segment_bounds(segment_index)
+        seg_hint = f"· **{geom.segment_label(segment_index)}** ({lo:.0f}–{hi:.0f} s)"
     st.info(
         f"**Widok osi X:** {nav_mode} · **zakres:** {x_range[0]:.0f}–{x_range[1]:.0f} s · kursor **{cursor_s:.1f} s** "
-        + (
-            f"· okno {window_s:.0f} s"
-            if nav_mode == NAV_WINDOW
-            else (f"· segment {segment_index + 1}" if nav_mode == NAV_SEGMENT else "")
-        )
+        + (f"· okno {window_s:.0f} s" if nav_mode == NAV_WINDOW else seg_hint)
     )
 
-    st.markdown("**Legenda tła:** paski = kolejne segmenty sesji. **Czerwona linia** = kursor czasu.")
+    if geom.uses_disjoint_windows:
+        legenda_seg = "paski = **przedziały analizy CALM** z logu triggerów (pary kodów w `calm_triggers.py`). "
+    else:
+        legenda_seg = "paski = kolejne segmenty (z **.vmrk** / **New Segment** albo równe bloki). "
+    st.markdown(
+        f"**Legenda tła:** {legenda_seg}"
+        "**Czerwona linia** = kursor czasu."
+    )
 
     col_plots, col_tr = st.columns([1.65, 1.0], gap="large")
 
@@ -989,7 +1704,12 @@ Zanim dopniemy kolejne moduły (EEG, kwestionariusze, grupy), warto ustalić odp
         )
 
 
-def _render_gallery_tab(df_raw: pd.DataFrame, df_disp: pd.DataFrame, raw_fs_hz: float) -> None:
+def _render_gallery_tab(
+    df_raw: pd.DataFrame,
+    df_disp: pd.DataFrame,
+    raw_fs_hz: float,
+    geom: SessionGeom,
+) -> None:
     """Różne typy wykresów na tych samych danych — do dyskusji z promotorką."""
     st.markdown(
         """
@@ -1008,14 +1728,30 @@ spektrogram, uproszczony podział EDA, zmienność pulsu itd.
     )
 
     with ga:
-        st.caption("Agregaty po 6 segmentach — przydatne przy różnych **warunkach** w blokach.")
-        st.plotly_chart(vg.fig_segment_bar_summary(df_disp), use_container_width=True, key="gal_bar")
+        seg_src = (
+            "**przedziały CALM** (log `*triggers*.log`)"
+            if geom.uses_disjoint_windows
+            else "markery **New Segment** albo równe bloki"
+        )
+        st.caption(
+            f"Agregaty po **{geom.n_seg}** segmentach ({seg_src}) — "
+            "porównanie **warunków** między blokami."
+        )
+        st.plotly_chart(vg.fig_segment_bar_summary(df_disp, geom), use_container_width=True, key="gal_bar")
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(vg.fig_box_by_segment(df_disp, "puls_bpm"), use_container_width=True, key="gal_box_hr")
+            st.plotly_chart(
+                vg.fig_box_by_segment(df_disp, "puls_bpm", geom),
+                use_container_width=True,
+                key="gal_box_hr",
+            )
         with c2:
-            st.plotly_chart(vg.fig_box_by_segment(df_disp, "eda_us"), use_container_width=True, key="gal_box_eda")
-        st.plotly_chart(vg.fig_radar_segment_profile(df_disp), use_container_width=True, key="gal_radar")
+            st.plotly_chart(
+                vg.fig_box_by_segment(df_disp, "eda_us", geom),
+                use_container_width=True,
+                key="gal_box_eda",
+            )
+        st.plotly_chart(vg.fig_radar_segment_profile(df_disp, geom), use_container_width=True, key="gal_radar")
 
     with gb:
         st.caption("Rozkłady wartości, zależności między kanałami, wielowymiarowy profil (po normalizacji).")

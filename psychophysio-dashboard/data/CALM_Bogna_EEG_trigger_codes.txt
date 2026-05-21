@@ -1,0 +1,50 @@
+CALM-Bogna � kody trigger?w EEG (port r?wnoleg?y, unikalne na sekcj?)
+=====================================================================
+
+Code    Event
+----    -----
+1       Experiment start
+2       Experiment end
+10      Baseline: SAM pre � start
+11      Baseline: SAM pre � end
+20      Baseline: Pleasant induction � start
+21      Baseline: Pleasant induction � end
+30      Baseline: SAM post-induction � start
+31      Baseline: SAM post-induction � end
+40      Baseline: Rest � start
+41      Baseline: Rest � end
+50      Baseline: Conversation � start
+51      Baseline: Conversation � end
+60      Baseline: SAM post-conversation � start
+61      Baseline: SAM post-conversation � end
+100     Boundary: Induction � start
+101     Boundary: Induction � end
+110     Boundary: SAM post-induction � start
+111     Boundary: SAM post-induction � end
+120     Boundary: Rest 1 � start
+121     Boundary: Rest 1 � end
+130     Boundary: SAM post-rest-1 � start
+131     Boundary: SAM post-rest-1 � end
+140     Boundary: Rest 2 � start
+141     Boundary: Rest 2 � end
+150     Boundary: SAM post-rest-2 � start
+151     Boundary: SAM post-rest-2 � end
+160     Boundary: Conversation � start
+161     Boundary: Conversation � end
+170     Boundary: SAM post-conversation � start
+171     Boundary: SAM post-conversation � end
+
+
+Wycinki szczeg?lnie istotne dla analizy
+---------------------------------------
+
+Rest (odpoczynek):
+  - Baseline rest:            kody 40-41  (od 40 do 41)
+  - Boundary - rest pierwszy: kody 120-121
+  - Boundary - rest drugi:    kody 140-141
+
+Wspomnienia (pleasant / boundary induction):
+  - Baseline - wspomnienia:   kody 20-21
+  - Boundary - wspomnienia:   kody 100-101
+
+(Uwaga: przedzia? czasu mi?dzy markerem �start� a �end� dla danej pary kod?w.)

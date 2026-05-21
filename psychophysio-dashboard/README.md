@@ -7,7 +7,7 @@ To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC n
 ## Funkcje
 
 - **Źródło danych:** tryb **syntetyczny** (demo) albo **BrainVision** — pliki `.vhdr` + `.eeg` w folderze `data/` (rekurencyjnie, także podfoldery). Ostatnie cztery kanały w typowym zapisie 68-kanałowym są mapowane na: oddech (Resp01T), drugi tor oddechu / „ECG” w UI (Resp02B), EDA (GSR), sygnał HR z nagłówka (µV; kolumna w kodzie historycznie `puls_bpm`).
-- **Sesja i transkrypt:** cztery szeregi czasowe (surowe i wersja wygładzona / rzadsza), nakładka po normalizacji min–max, **nawigacja** po osi czasu (cała sesja / okno wokół kursora / segmenty), transkrypt w iframe z podświetleniem wg kursora.
+- **Sesja i transkrypt:** cztery szeregi czasowe (surowe i wersja wygładzona / rzadsza), nakładka po normalizacji min–max, **nawigacja** po osi czasu (cała sesja / okno wokół kursora / **segmenty**), transkrypt w iframe z podświetleniem wg kursora. **Segmenty** przy BrainVision: z **`.vmrk`** — granice z markerów **`New Segment`** (czas z pozycji próbek i Fs z nagłówka). Gdy markery dają **tylko jeden** segment (np. jeden `New Segment` na początku pliku), używany jest **równy podział na 6 bloków** jak przy danych syntetycznych; bez markerów `New Segment` — tak samo **6 równych** bloków.
 - **Walidacja po wczytaniu** (expander): heurystyki dla BV (Fs, NaN, zmienność torów, stałe zera na dodatkowych kanałach) oraz dla transkryptu (przedziały czasu, długość vs sesja, nakładania itd.).
 - **Galeria:** histogramy, korelacje, wykresy po segmentach, spektrogram (z decymacją przy bardzo długich nagraniach), uproszczony podział EDA tonic/phasic, zmienność pulsu w oknach.
 - **QC / preprocessing — ECG:** tor `ecg_mv`, filtracja, detekcja R (heurystyka), histogram RR, krótkie podsumowanie jakości (parametryzowalne progi).
@@ -50,6 +50,8 @@ Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhd
 |---------------|------|
 | `app.py` | Aplikacja Streamlit (zakładki: sesja, galeria, QC ECG) |
 | `data_loader.py` | BrainVision: nagłówek `.vhdr`, multipleks INT16 z `.eeg` |
+| `bv_markers.py` | Parsowanie `.vmrk`, czasy markerów **New Segment** |
+| `session_geom.py` | Krawędzie segmentów (równy podział albo z markerów) |
 | `data_validation.py` | Raporty walidacji BV i transkryptu |
 | `ecg_qc.py` | Preprocessing i heurystyczny QC toru `ecg_mv` |
 | `transcript_io.py` | Wczytywanie transkryptu JSON / CSV |
@@ -66,13 +68,13 @@ Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhd
 
 - **Synchronizacja czasu** między rekorderem BV, audio, transkryptem (wspólna oś w sekundach vs osobne korekty).
 - **Publikacja vs eksploracja:** które wersje sygnału (surowy / filtrowany / decymowany) idą do rozdziałów metody i figur.
-- **Segmentacja:** równe bloki czasu w UI vs **markery** z `.vmrk` lub zewnętrznego harmonogramu zadania.
+- **Segmentacja:** inne typy markerów BV (Stimulus, Response…) na osi czasu i w etykietach bloków — obecnie tylko **New Segment** buduje podział.
 - **Jednostki i nazewnictwo:** oś „puls” jako sygnał z czujnika (µV) vs wyliczone BPM; spójność podpisów osi z metodą.
 - **QC i HRV:** obecna detekcja R to orientacyjny pipeline — przed analizą HRV warto ustalić finalny łańcuch z narzędziami klinicznymi lub zespołową procedurą.
 
 ## Dalsze kroki rozwoju (skrót)
 
-- Wczytywanie **markerów** (np. z `.vmrk`) na oś czasu i warunki eksperymentalne.
+- Podgląd **wszystkich** markerów `.vmrk` na osi czasu i wybór typu do segmentacji (nie tylko **New Segment**).
 - **Kwestionariusze** (CSV) i łączenie z `subject_id` / sesją na wykresach.
 - Moduł **EEG** (osobna ścieżka czasu, epoki, ewentualnie MNE).
 - Eksport figur (rozdzielczość, fonty) i ewentualnie testy automatyczne dla `data_loader` / walidacji.

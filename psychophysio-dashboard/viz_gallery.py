@@ -11,32 +11,55 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy import signal as scipy_signal
 
-N_SEG = 6
+from session_geom import SessionGeom
 
 
-def _seg_layout(df: pd.DataFrame) -> tuple[float, float, int]:
-    session_s = max(float(df["time_s"].max()), 1.0)
-    seg_len = session_s / N_SEG
-    return session_s, seg_len, N_SEG
+def _df_session_s(df: pd.DataFrame) -> float:
+    """Koniec osi czasu z kolumny `time_s` (wykresy bez własnej segmentacji)."""
+    return max(float(df["time_s"].max()), 1.0)
 
 
-def _with_segment(df: pd.DataFrame) -> pd.DataFrame:
-    session_s, seg_len, n_seg = _seg_layout(df)
+def _time_to_segment_idx(t: np.ndarray, geom: SessionGeom) -> np.ndarray:
+    if geom.analysis_windows:
+        out = np.full(np.asarray(t).shape, -1, dtype=int)
+        tt = np.asarray(t, dtype=float)
+        for i, (lo, hi) in enumerate(geom.analysis_windows):
+            mask = (tt >= lo) & (tt <= hi)
+            out = np.where(mask, i, out)
+        return out
+    edges = np.asarray(geom.segment_edges, dtype=float)
+    idx = np.searchsorted(edges, t, side="right") - 1
+    return np.clip(idx, 0, max(0, geom.n_seg - 1))
+
+
+def _with_segment(df: pd.DataFrame, geom: SessionGeom) -> pd.DataFrame:
     d = df.copy()
-    d["segment"] = (d["time_s"] // seg_len).astype(np.int64).clip(0, n_seg - 1)
+    d["segment"] = _time_to_segment_idx(d["time_s"].to_numpy(dtype=float), geom)
     return d
 
 
-def fig_segment_bar_summary(df: pd.DataFrame) -> go.Figure:
-    """Średnie (±SD) HR i EDA w każdym z 6 segmentów — porównanie bloków eksperymentalnych."""
-    d = _with_segment(df)
-    g = d.groupby("segment", sort=True).agg(
-        hr=("puls_bpm", "mean"),
-        hr_sd=("puls_bpm", "std"),
-        eda=("eda_us", "mean"),
-        eda_sd=("eda_us", "std"),
+def fig_segment_bar_summary(df: pd.DataFrame, geom: SessionGeom) -> go.Figure:
+    """Średnie (±SD) HR i EDA w każdym segmencie (krawędzie z `SessionGeom`)."""
+    d = _with_segment(df, geom)
+    d = d[d["segment"] >= 0]
+    if d.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title_text="Podsumowanie po segmentach — brak próbek w wybranych przedziałach czasu",
+            height=520,
+        )
+        return fig
+    g = (
+        d.groupby("segment", sort=True)
+        .agg(
+            hr=("puls_bpm", "mean"),
+            hr_sd=("puls_bpm", "std"),
+            eda=("eda_us", "mean"),
+            eda_sd=("eda_us", "std"),
+        )
+        .reindex(range(geom.n_seg))
     )
-    seg_labels = [f"Seg. {i + 1}" for i in g.index]
+    seg_labels = [geom.segment_label(i) for i in range(geom.n_seg)]
 
     fig = make_subplots(
         rows=2,
@@ -67,7 +90,7 @@ def fig_segment_bar_summary(df: pd.DataFrame) -> go.Figure:
         col=1,
     )
     fig.update_layout(
-        title_text="Podsumowanie po segmentach (średnia ± SD w bloku 10 min)",
+        title_text="Podsumowanie po segmentach (średnia ± SD na blok)",
         height=520,
         margin=dict(t=80),
     )
@@ -175,7 +198,7 @@ def fig_rolling_hr_variability(df: pd.DataFrame, window_s: float = 60.0) -> go.F
         yaxis_title="SD (bpm)",
         height=360,
     )
-    session_s, _, _ = _seg_layout(df)
+    session_s = _df_session_s(df)
     fig.update_xaxes(range=(0, session_s))
     return fig
 
@@ -198,7 +221,7 @@ def fig_eda_tonic_phasic(df: pd.DataFrame, tonic_window_s: float = 60.0) -> go.F
     fig.add_trace(go.Scatter(x=d["time_s"], y=tonic, line=dict(width=1), name="toniczna"), row=1, col=1)
     fig.add_trace(go.Scatter(x=d["time_s"], y=phasic, line=dict(width=0.8), name="fazyczna"), row=2, col=1)
     fig.update_layout(height=520, showlegend=False, title_text="EDA: prosty podział tonic / phasic (demo)")
-    session_s, _, _ = _seg_layout(df)
+    session_s = _df_session_s(df)
     fig.update_xaxes(range=(0, session_s), row=2, col=1)
     return fig
 
@@ -225,15 +248,15 @@ def fig_scatter_hr_eda_timecolor(df: pd.DataFrame, max_points: int = 5000) -> go
     return fig
 
 
-def fig_box_by_segment(df: pd.DataFrame, metric: str) -> go.Figure:
+def fig_box_by_segment(df: pd.DataFrame, metric: str, geom: SessionGeom) -> go.Figure:
     """Wykres pudełkowy jednej zmiennej w podziale na segmenty."""
-    _, _, n_seg = _seg_layout(df)
-    d = _with_segment(df)
-    labels = {i: f"Seg.{i + 1}" for i in range(n_seg)}
-    d["lab"] = d["segment"].map(labels)
+    n_seg = geom.n_seg
+    d = _with_segment(df, geom)
+    d = d[d["segment"] >= 0]
     fig = go.Figure()
-    for lab in [f"Seg.{i + 1}" for i in range(n_seg)]:
-        sub = d[d["lab"] == lab][metric]
+    for i in range(n_seg):
+        lab = geom.segment_label(i)
+        sub = d[d["segment"] == i][metric]
         fig.add_trace(go.Box(y=sub, name=lab, boxmean="sd"))
     ttl = {"puls_bpm": "Puls (bpm)", "eda_us": "EDA (µS)", "oddech": "Oddech (a.u.)"}[metric]
     fig.update_layout(title=f"Rozstrzelenie wartości: {ttl} · wg segmentu", height=420)
@@ -266,14 +289,16 @@ def fig_parallel_coords(df: pd.DataFrame, max_rows: int = 1500) -> go.Figure:
     return fig
 
 
-def fig_radar_segment_profile(df: pd.DataFrame) -> go.Figure:
-    """Profil segmentu w przestrzeni z-score (średnie) — szybkie porównanie 6 bloków."""
-    d = _with_segment(df)
-    _, _, n_seg = _seg_layout(df)
+def fig_radar_segment_profile(df: pd.DataFrame, geom: SessionGeom) -> go.Figure:
+    """Profil segmentu w przestrzeni z-score (średnie) — porównanie bloków wg `geom`."""
+    d = _with_segment(df, geom)
+    d = d[d["segment"] >= 0]
+    n_seg = geom.n_seg
     metrics = ["oddech", "puls_bpm", "eda_us"]
-    agg = d.groupby("segment")[metrics].mean()
+    agg = d.groupby("segment", sort=True)[metrics].mean().reindex(range(n_seg))
+    agg = agg.fillna(0.0)
     for m in metrics:
-        mu, sigma = agg[m].mean(), agg[m].std()
+        mu, sigma = float(agg[m].mean()), float(agg[m].std())
         sigma = max(sigma, 1e-9)
         agg[m] = (agg[m] - mu) / sigma
     categories = ["oddech", "puls", "EDA"]
@@ -282,7 +307,9 @@ def fig_radar_segment_profile(df: pd.DataFrame) -> go.Figure:
         vals = list(agg.loc[i, metrics].values) + [agg.loc[i, metrics[0]]]
         cats = categories + [categories[0]]
         fig.add_trace(
-            go.Scatterpolar(r=vals, theta=cats, fill="toself", name=f"Seg. {i + 1}", opacity=0.55)
+            go.Scatterpolar(
+                r=vals, theta=cats, fill="toself", name=geom.segment_label(i), opacity=0.55
+            )
         )
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[-2, 2])),
