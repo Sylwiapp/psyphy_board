@@ -81,6 +81,15 @@ class EcgQcOptions:
     clip_margin_ratio: float = 0.995
     clip_warn_frac: float = 0.001
 
+    # Stage 4 (SQI per epoch) — minimalna jakość okna z `nk.ecg_quality`.
+    # Wartości <0.5 zwykle oznaczają, że kształt QRS w tym oknie odbiega
+    # od szablonu zbudowanego z większości uderzeń (Quigley et al. 2024).
+    sqi_min_window: float = 0.5
+    # Stage 6 (exclusion) — segment z udziałem korekt RR (Lipponen-Tarvainen 2019)
+    # przekraczającym ten próg jest oznaczany jako „nie-OK" do HRV.
+    # Domyślnie 5 % zgodnie z konwencją przyjmowaną w SPR / NK2 literaturze.
+    corrected_frac_max: float = 0.05
+
 
 @dataclass
 class RPeaksResult:
@@ -119,6 +128,8 @@ class EcgWindowSegment:
     flat_window: bool
     n_peaks_in_window: int
     rr_outside_frac_window: float | None  # None jeśli < 2 R w oknie
+    mean_quality_window: float | None = None  # Stage 4: SQI per-epoch (NK2)
+    corrected_frac_window: float | None = None  # Stage 5/6: % korekt RR w oknie
 
 
 @dataclass
@@ -145,6 +156,7 @@ class EcgQcReport:
 
     mean_quality: float | None = None
     n_corrections: int = 0
+    corrected_frac: float = 0.0  # Stage 6: % korekt RR względem n_peaks (LT19)
     n_manual_added: int = 0
     n_manual_removed: int = 0
 
@@ -280,19 +292,104 @@ def apply_manual_edits(
     return np.sort(peaks), n_added, n_removed
 
 
-def signal_quality(
+def compute_spectrum_welch(
+    x: np.ndarray, fs: float, max_freq_hz: float = 80.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spectral density estimation via Welch (scipy). Returns (freqs, psd) up to ``max_freq_hz``.
+
+    Używane do dydaktycznego porównania widma surowy vs po filtracji w Stage 2:
+    pozwala pokazać znikający peak 50 Hz oraz redukcję mocy w paśmie < 0.5 Hz.
+    """
+    from scipy import signal as _sps  # opóźniony import, scipy jest w requirements
+
+    x = np.asarray(x, dtype=float).ravel()
+    x = x[np.isfinite(x)]
+    if x.size < 4 or fs <= 0:
+        return np.array([]), np.array([])
+    # nperseg dobrane tak, żeby dać rozdzielczość ~0.05 Hz (ale nie więcej niż 1/8 sygnału)
+    nperseg = int(min(max(int(fs * 8), 256), max(256, x.size // 4)))
+    nperseg = max(64, nperseg)
+    try:
+        freqs, psd = _sps.welch(
+            x,
+            fs=float(fs),
+            nperseg=min(nperseg, x.size),
+            noverlap=None,
+            scaling="density",
+        )
+    except Exception:  # noqa: BLE001
+        return np.array([]), np.array([])
+    mask = freqs <= float(max_freq_hz)
+    return freqs[mask], psd[mask]
+
+
+def compute_baseline_drift_std(x: np.ndarray, fs: float, cutoff_hz: float = 0.5) -> float:
+    """Std sygnału w paśmie < ``cutoff_hz`` — proxy dla amplitudy „baseline wandera".
+
+    Implementacja: filtr dolnoprzepustowy 4-rzędowy Butterworth (`filtfilt` =>
+    zerowe opóźnienie fazowe), następnie odchylenie standardowe wyniku. Im
+    większa wartość, tym silniejsze wędrowanie linii bazowej w sygnale.
+    """
+    from scipy import signal as _sps
+
+    x = np.asarray(x, dtype=float).ravel()
+    x = x[np.isfinite(x)]
+    if x.size < 16 or fs <= 0 or cutoff_hz <= 0 or cutoff_hz >= fs / 2:
+        return 0.0
+    try:
+        nyq = 0.5 * float(fs)
+        b, a = _sps.butter(4, float(cutoff_hz) / nyq, btype="low")
+        y = _sps.filtfilt(b, a, x, padlen=min(len(x) - 1, 3 * max(len(a), len(b))))
+        return float(np.std(y))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def compute_powerline_power(
+    x: np.ndarray, fs: float, target_hz: float = 50.0, half_bw_hz: float = 2.0
+) -> float:
+    """Średnia gęstość spektralna w paśmie ``target_hz ± half_bw_hz`` (proxy dla zakłócenia sieciowego).
+
+    Z założenia używana parami (raw/cleaned), żeby pokazać redukcję po notch
+    filter w Stage 2. Wartość bezwzględna jest jednostkowo zależna od skali
+    sygnału — to porównanie raw→cleaned ma sens, nie sama liczba.
+    """
+    freqs, psd = compute_spectrum_welch(x, fs, max_freq_hz=max(target_hz + 2 * half_bw_hz, 80.0))
+    if freqs.size == 0:
+        return 0.0
+    band = (freqs >= target_hz - half_bw_hz) & (freqs <= target_hz + half_bw_hz)
+    if not np.any(band):
+        return 0.0
+    return float(np.mean(psd[band]))
+
+
+def signal_quality_series(
     cleaned: np.ndarray, peaks_idx: np.ndarray, fs: float
-) -> float | None:
-    """Mean NK2 `ecg_quality` over the recording (0..1, 1 = best)."""
+) -> np.ndarray | None:
+    """Per-sample NK2 `ecg_quality` (0..1, 1 = best). None gdy NK2 niedostępny.
+
+    Stage 4 z dokumentu (SQI) — porównuje każde QRS do szablonu zbudowanego
+    z większości uderzeń. Zwracana seria ma długość `cleaned`; może zawierać
+    NaN tam, gdzie NK2 nie był w stanie policzyć jakości.
+    """
     if not NK_AVAILABLE or peaks_idx.size < 4 or cleaned.size < int(2 * fs):
         return None
     try:
         q = nk.ecg_quality(cleaned, rpeaks=peaks_idx, sampling_rate=float(fs))
-        q = np.asarray(q, dtype=float)
-        q = q[np.isfinite(q)]
-        return float(np.mean(q)) if q.size else None
+        return np.asarray(q, dtype=float)
     except Exception:  # noqa: BLE001
         return None
+
+
+def signal_quality(
+    cleaned: np.ndarray, peaks_idx: np.ndarray, fs: float
+) -> float | None:
+    """Mean NK2 `ecg_quality` over the recording (0..1, 1 = best)."""
+    q = signal_quality_series(cleaned, peaks_idx, fs)
+    if q is None:
+        return None
+    q = q[np.isfinite(q)]
+    return float(np.mean(q)) if q.size else None
 
 
 def compute_ecg_qc_report(
@@ -305,8 +402,20 @@ def compute_ecg_qc_report(
     mean_quality: float | None = None,
     n_manual_added: int = 0,
     n_manual_removed: int = 0,
+    quality_series: np.ndarray | None = None,
+    peaks_uncorrected: np.ndarray | None = None,
+    fix_indices_uncorr: np.ndarray | None = None,
 ) -> EcgQcReport:
-    """Aggregate QC over the recording given already-detected (and possibly edited) peaks."""
+    """Aggregate QC over the recording given already-detected (and possibly edited) peaks.
+
+    Parametry opcjonalne (Stage 4–6 z dokumentu referencyjnego):
+    - ``quality_series``: per-sample seria NK2 ``ecg_quality`` (długość jak ``ecg_raw``);
+      jeżeli podana, raport oblicza średni SQI w oknie.
+    - ``peaks_uncorrected``: piki R **przed** korekcją RR; konieczne do liczenia
+      udziału korekt LT19 per-okno.
+    - ``fix_indices_uncorr``: zbiorczy zestaw indeksów piku korygowanego (typy
+      ``ectopic | missed | extra | longshort``) wskazujący do ``peaks_uncorrected``.
+    """
     notes: list[str] = []
     t = np.asarray(time_s, dtype=float).ravel()
     x = np.asarray(ecg_raw, dtype=float).ravel()
@@ -351,6 +460,47 @@ def compute_ecg_qc_report(
     seg_list: list[EcgWindowSegment] = []
     peaks_idx_arr = np.asarray(peaks_idx, dtype=int).ravel()
     peak_times = t[peaks_idx_arr] if peaks_idx_arr.size else np.array([], dtype=float)
+
+    q_series = (
+        np.asarray(quality_series, dtype=float).ravel()
+        if quality_series is not None
+        else None
+    )
+    if q_series is not None and q_series.size > n:
+        q_series = q_series[:n]
+
+    peaks_uncorr_arr = (
+        np.asarray(peaks_uncorrected, dtype=int).ravel()
+        if peaks_uncorrected is not None
+        else None
+    )
+    fix_idx_arr = (
+        np.asarray(fix_indices_uncorr, dtype=int).ravel()
+        if fix_indices_uncorr is not None
+        else None
+    )
+    fix_times: np.ndarray = np.array([], dtype=float)
+    peaks_uncorr_times: np.ndarray = np.array([], dtype=float)
+    if peaks_uncorr_arr is not None and peaks_uncorr_arr.size:
+        valid = (peaks_uncorr_arr >= 0) & (peaks_uncorr_arr < n)
+        peaks_uncorr_arr = peaks_uncorr_arr[valid]
+        peaks_uncorr_times = t[peaks_uncorr_arr] if peaks_uncorr_arr.size else fix_times
+        if fix_idx_arr is not None and fix_idx_arr.size and peaks_uncorr_arr.size:
+            in_range = (fix_idx_arr >= 0) & (fix_idx_arr < peaks_uncorr_arr.size)
+            fix_local = fix_idx_arr[in_range]
+            if fix_local.size:
+                fix_sample_idx = peaks_uncorr_arr[fix_local]
+                fix_sample_idx = fix_sample_idx[
+                    (fix_sample_idx >= 0) & (fix_sample_idx < n)
+                ]
+                fix_times = t[fix_sample_idx] if fix_sample_idx.size else fix_times
+
+    n_corr_in_total = (
+        int(n_corrections) if n_corrections else int(fix_times.size)
+    )
+    corrected_frac_global = (
+        (n_corr_in_total / n_peaks) if n_peaks else 0.0
+    )
 
     if n > 1 and duration_min * 60 >= win * 0.5:
         t0s, t1s = float(t[0]), float(t[-1])
@@ -405,6 +555,39 @@ def compute_ecg_qc_report(
                     f"Za mało wykrytych R w oknie ({n_pw}; potrzebne ≥2 do oceny RR)"
                 )
 
+            mean_q_w: float | None = None
+            if q_series is not None:
+                q_seg = q_series[m]
+                q_seg = q_seg[np.isfinite(q_seg)]
+                if q_seg.size:
+                    mean_q_w = float(np.mean(q_seg))
+                    if mean_q_w < opt.sqi_min_window:
+                        ok = False
+                        reasons.append(
+                            f"Niska jakość sygnału w oknie (NK2 SQI {mean_q_w:.2f} "
+                            f"< próg {opt.sqi_min_window:.2f}; "
+                            "morfologia QRS odbiega od szablonu)"
+                        )
+
+            corr_w: float | None = None
+            if peaks_uncorr_times.size:
+                n_uncorr_w = int(
+                    np.sum((peaks_uncorr_times >= a) & (peaks_uncorr_times < b))
+                )
+                if n_uncorr_w > 0:
+                    n_fix_w = int(
+                        np.sum((fix_times >= a) & (fix_times < b))
+                    )
+                    corr_w = n_fix_w / n_uncorr_w
+                    if corr_w > opt.corrected_frac_max:
+                        ok = False
+                        reasons.append(
+                            f"Wysoki udział korekt RR (LT19) w oknie "
+                            f"({corr_w * 100:.1f} % > próg "
+                            f"{opt.corrected_frac_max * 100:.0f} %); rozważ "
+                            "wykluczenie segmentu z HRV"
+                        )
+
             if ok:
                 n_ok += 1
 
@@ -418,6 +601,8 @@ def compute_ecg_qc_report(
                     flat_window=flat_w,
                     n_peaks_in_window=n_pw,
                     rr_outside_frac_window=rr_win_bad,
+                    mean_quality_window=mean_q_w,
+                    corrected_frac_window=corr_w,
                 )
             )
     win_frac = (n_ok / n_win) if n_win else 0.0
@@ -436,6 +621,8 @@ def compute_ecg_qc_report(
         bad_reasons.append("windows")
     if mean_quality is not None and mean_quality < 0.5:
         bad_reasons.append("low_quality")
+    if corrected_frac_global > opt.corrected_frac_max:
+        bad_reasons.append("high_corrected_frac")
 
     if (
         not bad_reasons
@@ -459,10 +646,12 @@ def compute_ecg_qc_report(
         notes.append(
             "NeuroKit2 nie jest zainstalowany — `py -3 -m pip install neurokit2`."
         )
-    if n_corrections:
+    if n_corr_in_total:
         notes.append(
             "Algorytm korekcji artefaktów RR (Lipponen-Tarvainen 2019, 'Kubios' "
-            f"w NK2) zmodyfikował {n_corrections} pików."
+            f"w NK2) zmodyfikował {n_corr_in_total} pików "
+            f"({corrected_frac_global * 100:.2f} % wszystkich R-peaków; "
+            f"próg segmentowy {opt.corrected_frac_max * 100:.0f} %)."
         )
     if n_manual_added or n_manual_removed:
         notes.append(
@@ -489,7 +678,8 @@ def compute_ecg_qc_report(
         window_ok_fraction=win_frac,
         window_segments=tuple(seg_list),
         mean_quality=mean_quality,
-        n_corrections=n_corrections,
+        n_corrections=n_corr_in_total,
+        corrected_frac=float(corrected_frac_global),
         n_manual_added=n_manual_added,
         n_manual_removed=n_manual_removed,
         overall_label=label,
