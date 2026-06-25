@@ -6,7 +6,7 @@ To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC n
 
 ## Funkcje
 
-- **Źródło danych:** tryb **syntetyczny** (demo) albo **BrainVision** — pliki `.vhdr` + `.eeg` w folderze `data/` (rekurencyjnie, także podfoldery). Ostatnie cztery kanały w typowym zapisie 68-kanałowym są mapowane na: oddech (Resp01T), drugi tor oddechu / „ECG” w UI (Resp02B), EDA (GSR), sygnał HR z nagłówka (µV; kolumna w kodzie historycznie `puls_bpm`).
+- **Źródło danych:** tryb **syntetyczny** (demo), **BrainVision** — pliki `.vhdr` + `.eeg` w folderze `data/` (rekurencyjnie, także podfoldery), albo **CASE** (Sharma et al. 2019) — otwarty zbiór z **prawdziwym ECG** (patrz sekcja „Dane CASE” niżej). Ostatnie cztery kanały w typowym zapisie BrainVision 68-kanałowym są mapowane na: oddech (Resp01T), drugi tor oddechu / „ECG” w UI (Resp02B), EDA (GSR), sygnał HR z nagłówka (µV; kolumna w kodzie historycznie `puls_bpm`).
 - **Sesja i transkrypt:** cztery szeregi czasowe (surowe i wersja wygładzona / rzadsza), nakładka po normalizacji min–max, **nawigacja** po osi czasu (cała sesja / okno wokół kursora / **segmenty**), transkrypt w iframe z podświetleniem wg kursora. **Segmenty** przy BrainVision: z **`.vmrk`** — granice z markerów **`New Segment`** (czas z pozycji próbek i Fs z nagłówka). Gdy markery dają **tylko jeden** segment (np. jeden `New Segment` na początku pliku), używany jest **równy podział na 6 bloków** jak przy danych syntetycznych; bez markerów `New Segment` — tak samo **6 równych** bloków.
 - **Walidacja po wczytaniu** (expander): heurystyki dla BV (Fs, NaN, zmienność torów, stałe zera na dodatkowych kanałach) oraz dla transkryptu (przedziały czasu, długość vs sesja, nakładania itd.).
 - **Galeria:** histogramy, korelacje, wykresy po segmentach, spektrogram (z decymacją przy bardzo długich nagraniach), uproszczony podział EDA tonic/phasic, zmienność pulsu w oknach.
@@ -50,6 +50,7 @@ Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhd
 |---------------|------|
 | `app.py` | Aplikacja Streamlit (zakładki: sesja, galeria, QC ECG) |
 | `data_loader.py` | BrainVision: nagłówek `.vhdr`, multipleks INT16 z `.eeg` |
+| `case_loader.py` | CASE: wczytanie `interpolated/physiological/sub_*.csv`, segmenty z kolumny `video` |
 | `bv_markers.py` | Parsowanie `.vmrk`, czasy markerów **New Segment** |
 | `session_geom.py` | Krawędzie segmentów (równy podział albo z markerów) |
 | `data_validation.py` | Raporty walidacji BV i transkryptu |
@@ -62,7 +63,29 @@ Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhd
 ## Dane w `data/`
 
 - **BrainVision:** spójny zestaw `.vhdr` + `.eeg` (i ewentualnie `.vmrk`). Pliki `Data-*.txt` to **logi impedancji**, nie szereg czasowy sygnału.
-- **Repozytorium:** w `.gitignore` są wzorce na surowe pliki sesji w `data/` (`.eeg`, `.vhdr`, `.vmrk`, logi impedancji, transkrypt JSON poza przykładem, folder `articles/`). **Małe fixture’y** zostają w `data/validation_samples/`. **RODO / etyka** przy udostępnianiu danych poza Gitem.
+- **Repozytorium:** w `.gitignore` są wzorce na surowe pliki sesji w `data/` (`.eeg`, `.vhdr`, `.vmrk`, logi impedancji, transkrypt JSON poza przykładem, folder `articles/`), a także zbiór CASE (`data/CASE_full/`). **Małe fixture’y** zostają w `data/validation_samples/`. **RODO / etyka** przy udostępnianiu danych poza Gitem.
+
+## Dane CASE (Sharma et al. 2019)
+
+CASE to otwarty zbiór ciągłych sygnałów fizjologicznych nagranych podczas oglądania filmów emocjonalnych (30 osób). Zawiera **prawdziwe ECG**, dlatego używamy go do zakładki QC/preprocessing ECG i analiz HRV.
+
+- **Źródło:** Sharma, K., Castellini, C., van den Broek, E. L., Albu-Schaeffer, A., Schwenker, F. (2019). *A dataset of continuous affect annotations and physiological signals for emotion analysis.* Scientific Data 6, 196. DOI **10.1038/s41597-019-0209-0**. Pełna paczka danych jest hostowana na **figshare** (link w artykule; pobierasz archiwum „full”).
+- **Dane są poza Gitem** (`.gitignore`) — po sklonowaniu repo musisz pobrać CASE samodzielnie.
+- **Rozpakowanie:** wypakuj tak, aby istniała ścieżka
+  `data/CASE_full/data/interpolated/physiological/sub_*.csv`
+  (loader szuka katalogu zawierającego `.../interpolated/physiological`, więc dokładna nazwa folderu nadrzędnego nie jest krytyczna).
+- **Wariant:** korzystamy z **`interpolated`** (1000 Hz, równa siatka czasu). To jest **sygnał surowy** — CASE **nie filtruje** fizjologii (dodaje tylko video-ID, konwersję jednostek części kanałów i interpolację liniową). Filtracja (Stage 2: HP/LP/notch) jest **po Twojej stronie** w aplikacji.
+- **Mapowanie kanałów** (w `case_loader.py`):
+
+| CASE | kolumna aplikacji | uwaga |
+|------|-------------------|-------|
+| `ecg` | `ecg_mv` | **prawdziwe ECG** (w woltach) |
+| `rsp` | `oddech` | pas oddechowy |
+| `gsr` | `eda_us` | przewodność skóry |
+| `bvp` | `puls_bpm` | BVP/PPG — **przebieg pulsu, nie BPM** |
+| `daqtime/1000` | `time_s` | `daqtime` jest w ms |
+
+- **Segmenty = wideo:** kolumna `video` koduje bodziec; loader buduje z niej segmenty (8 wideo emocjonalnych + `bluVid`/`startVid`/`endVid`). W sidebarze wybierasz **podmiot** i **segment** — domyślnie pierwsze wideo emocjonalne (~2–3 min, szybki pipeline). Opcja **„Cała sesja”** ładuje ~2,5 mln próbek (wolne).
 
 ## Zagadnienia do rozważenia
 

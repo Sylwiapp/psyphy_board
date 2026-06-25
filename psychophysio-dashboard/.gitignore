@@ -1,14 +1,20 @@
 __pycache__/
 
-# Dane sesji / pomiar?w w katalogu data/ (trzymaj lokalnie — opis w README)
+# Dane sesji / pomiar?w w katalogu data/ (trzymaj lokalnie ï¿½ opis w README)
 data/*.eeg
 data/*.vhdr
 data/*.vmrk
 data/Data-*.txt
 
-# W?asny transkrypt wrzucony do data/*.json — w repo zostaje tylko przyk?ad
+# W?asny transkrypt wrzucony do data/*.json ï¿½ w repo zostaje tylko przyk?ad
 data/*.json
 !data/transcript.example.json
 
 # Lokalna biblioteka PDF (nie kod projektu)
 data/articles/
+
+# Zbior CASE (duzy, ~kilka GB) ï¿½ trzymaj lokalnie
+data/CASE_full/
+data/9891446/
+# Archiwa danych (np. pobrana paczka CASE) â€” nie commitujemy do Gita
+data/*.zip

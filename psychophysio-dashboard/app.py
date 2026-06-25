@@ -17,6 +17,15 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
+from case_loader import (
+    CASE_FS_HZ,
+    CaseSegment,
+    default_segment_index,
+    find_case_root,
+    find_case_subjects,
+    load_case_subject_full,
+    slice_segment,
+)
 from transcript_io import Utterance, load_transcript_auto, load_transcript_json_bytes
 from bv_markers import new_segment_times_seconds, parse_vmrk, resolve_vmrk_path
 from data_loader import BrainVisionMeta, find_vhdr_files, load_brainvision_auxiliary
@@ -57,8 +66,11 @@ DEFAULT_SESSION_S = 60 * 60
 N_SEG_DEFAULT = 6
 
 
-# „Surowe”: wyższa częstotliwość (symulacja); „przetworzone”: wygładzenie + rzadsze próbki
-RAW_FS_HZ = 25.0
+# „Surowe”: wyższa częstotliwość (symulacja); „przetworzone”: wygładzenie + rzadsze próbki.
+# 250 Hz to MINIMUM zalecane przez Quigley et al. 2024 do detekcji R-piku (± dokładność RR).
+# Przy 25 Hz zespół QRS (~80 ms) zajmuje ~2 próbki i detekcja R jest niemożliwa, dlatego
+# cała syntetyczna sesja idzie teraz na 250 Hz — wspólna oś czasu dla wszystkich kanałów.
+RAW_FS_HZ = 250.0
 DISPLAY_FS_HZ = 4.0
 
 SEGMENT_COLORS = [
@@ -71,8 +83,58 @@ SEGMENT_COLORS = [
 ]
 
 
+def _synthesize_ecg(
+    t: np.ndarray, hr_bpm: np.ndarray, fs: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Realistyczny syntetyczny ECG z morfologią PQRST i detekowalnymi R-pikami.
+
+    Uderzenia są rozmieszczane wg chwilowego HR (z lekką arytmią oddechową), a każde dostaje
+    zestaw gaussowskich fal P-Q-R-S-T. Dokładamy świadomie trzy artefakty, żeby etapy QC miały
+    co pokazać: wędrowanie linii bazowej (< 0.5 Hz), składową sieci 50 Hz oraz szum szerokopasmowy.
+    """
+    n = t.size
+    ecg = np.zeros(n, dtype=float)
+    if n == 0 or fs <= 0:
+        return ecg
+    # (offset względem R [s], amplituda [mV], szerokość gaussa [s])
+    waves = (
+        (-0.16, 0.08, 0.025),   # P
+        (-0.025, -0.05, 0.012),  # Q
+        (0.0, 1.00, 0.010),      # R
+        (0.025, -0.15, 0.012),   # S
+        (0.16, 0.25, 0.040),     # T
+    )
+    duration = float(t[-1])
+    tb = 0.6  # pierwsze uderzenie
+    while tb < duration - 0.3:
+        hr_here = float(np.interp(tb, t, hr_bpm))
+        for off, amp, wid in waves:
+            mu = tb + off
+            lo = int(max(0, (mu - 4.0 * wid) * fs))
+            hi = int(min(n, (mu + 4.0 * wid) * fs))
+            if hi > lo:
+                seg = t[lo:hi]
+                ecg[lo:hi] += amp * np.exp(-0.5 * ((seg - mu) / wid) ** 2)
+        rr = 60.0 / max(hr_here, 1.0)
+        tb += rr * (1.0 + 0.02 * rng.standard_normal())  # drobny jitter RR
+
+    baseline = 0.10 * np.sin(2 * np.pi * 0.15 * t) + 0.05 * np.sin(2 * np.pi * 0.05 * t)
+    powerline = 0.02 * np.sin(2 * np.pi * 50.0 * t)
+    noise = 0.01 * rng.standard_normal(n)
+    return ecg + baseline + powerline + noise
+
+
+@st.cache_data(show_spinner="Wczytuję podmiot CASE (cała sesja, ~40 min)…")
+def _case_load_full_cached(
+    case_root_str: str, subject_id: int
+) -> tuple[pd.DataFrame, list[CaseSegment]]:
+    """Cache'owane wczytanie pełnej sesji CASE — czytane raz na podmiot, segmenty wycinamy w pamięci."""
+    return load_case_subject_full(Path(case_root_str), subject_id)
+
+
+@st.cache_data(show_spinner=False)
 def make_physiology_raw(seed: int, duration_s: float = DEFAULT_SESSION_S) -> pd.DataFrame:
-    """Syntetyczne sygnały ~surowe (wysoka fs)."""
+    """Syntetyczne sygnały ~surowe (wysoka fs). Cache'owane per (seed, duration)."""
     rng = np.random.default_rng(seed)
     n = int(duration_s * RAW_FS_HZ)
     t = np.arange(n) / RAW_FS_HZ
@@ -81,9 +143,8 @@ def make_physiology_raw(seed: int, duration_s: float = DEFAULT_SESSION_S) -> pd.
     # puls (bpm) — wolnozmienny + szum
     hr = 70 + 8 * np.sin(2 * np.pi * t / 400) + 1.5 * rng.standard_normal(n)
     hr = np.clip(hr, 52, 110)
-    # ECG — uproszczony (syntetyczny): komponent sinusoidalny + szum (nie jest to realistyczny EKG diagnostyczny)
-    phase = np.cumsum(hr / 60.0 / RAW_FS_HZ) * 2 * np.pi
-    ecg = np.sin(phase) * 0.4 + 0.15 * np.sin(3 * phase) + 0.08 * rng.standard_normal(n)
+    # ECG — realistyczny PQRST (patrz _synthesize_ecg); R-piki spójne z przebiegiem `hr`
+    ecg = _synthesize_ecg(t, hr, RAW_FS_HZ, rng)
     # EDA (µS)
     eda = 4.0 + 0.5 * np.sin(2 * np.pi * t / 500) + np.cumsum(0.015 * rng.standard_normal(n))
     eda += 0.2 * rng.standard_normal(n)
@@ -434,6 +495,67 @@ document.addEventListener("DOMContentLoaded", function() {{
 </body></html>"""
 
 
+def _render_case_source(
+    data_dir: Path,
+) -> tuple[pd.DataFrame, float, str, list[float] | None]:
+    """Sidebar UI + wczytanie danych CASE.
+
+    Zwraca `(df_raw, raw_fs_hz, data_note, seg_starts)`. `seg_starts` jest listą czasów
+    startu wideo tylko w trybie „cała sesja” (wtedy segmenty = wideo); inaczej `None`.
+    """
+    case_root = find_case_root(data_dir)
+    if case_root is None:
+        st.sidebar.warning(
+            "Nie znaleziono zbioru CASE w `data/` "
+            "(oczekiwane `.../interpolated/physiological/sub_*.csv`). Używam danych syntetycznych."
+        )
+        return make_physiology_raw(42), RAW_FS_HZ, "", None
+
+    subjects = find_case_subjects(case_root)
+    if not subjects:
+        st.sidebar.warning("Folder CASE bez plików `sub_*.csv`. Używam danych syntetycznych.")
+        return make_physiology_raw(42), RAW_FS_HZ, "", None
+
+    subject_id = int(st.sidebar.selectbox("Podmiot CASE", subjects, index=0))
+    df_full, segments = _case_load_full_cached(str(case_root), subject_id)
+
+    seg_options = ["Cała sesja (wolne, ~40 min)"] + [
+        f"{s.index + 1:02d} · {s.label} ({s.duration_s:.0f}s)" for s in segments
+    ]
+    default_pick = min(default_segment_index(segments) + 1, len(seg_options) - 1)
+    pick = st.sidebar.selectbox(
+        "Segment (wideo)",
+        seg_options,
+        index=default_pick,
+        help=(
+            "Zalecane: pojedyncze wideo emocjonalne (~2–3 min) — pipeline ECG liczy się szybko "
+            "i odpowiada jednemu warunkowi. „Cała sesja” to ~2,5 mln próbek (wolne)."
+        ),
+    )
+    st.sidebar.caption(
+        "Mapowanie: `ecg_mv` = ecg (ECG) · `oddech` = rsp · `eda_us` = gsr · `puls_bpm` = bvp (PPG)."
+    )
+
+    if pick.startswith("Cała sesja"):
+        seg_starts = [s.t_start_s for s in segments[1:]] if len(segments) > 1 else None
+        note = (
+            f"CASE — podmiot **{subject_id}**, **cała sesja** ({len(df_full):,} próbek × "
+            f"{CASE_FS_HZ:.0f} Hz). `ecg_mv` = **prawdziwe ECG**; `puls_bpm` = BVP/PPG (przebieg). "
+            "Uwaga: pipeline ECG na całej sesji jest wolny."
+        )
+        return df_full, float(CASE_FS_HZ), note, seg_starts
+
+    seg = segments[seg_options.index(pick) - 1]
+    df_seg = slice_segment(df_full, seg)
+    dur_min = float(df_seg["time_s"].iloc[-1]) / 60.0 if not df_seg.empty else 0.0
+    note = (
+        f"CASE — podmiot **{subject_id}**, segment **{seg.label}** "
+        f"({len(df_seg):,} próbek × {CASE_FS_HZ:.0f} Hz, ~{dur_min:.1f} min). "
+        "`ecg_mv` = **prawdziwe ECG** (V); `puls_bpm` = BVP/PPG (przebieg, nie BPM)."
+    )
+    return df_seg, float(CASE_FS_HZ), note, None
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, layout="wide")
     st.title(APP_NAME)
@@ -461,7 +583,11 @@ def main() -> None:
     st.sidebar.markdown("**Źródło sygnałów**")
     src = st.sidebar.radio(
         "Dane",
-        ["Syntetyczne (demo)", "BrainVision (.vhdr + .eeg w folderze data)"],
+        [
+            "Syntetyczne (demo)",
+            "BrainVision (.vhdr + .eeg w folderze data)",
+            "CASE (ECG — badanie naukowe)",
+        ],
         index=0,
     )
     raw_fs_hz = RAW_FS_HZ
@@ -469,8 +595,11 @@ def main() -> None:
     loaded_bv = False
     meta_bv: BrainVisionMeta | None = None
     pick_vhdr: Path | None = None
+    case_seg_starts_s: list[float] | None = None
     if src.startswith("Syntetyczne"):
         df_raw = make_physiology_raw(int(seed))
+    elif src.startswith("CASE"):
+        df_raw, raw_fs_hz, data_note, case_seg_starts_s = _render_case_source(data_dir)
     else:
         vhdrs = find_vhdr_files(data_dir)
         if not vhdrs:
@@ -501,10 +630,16 @@ def main() -> None:
                 data_note = msg
 
     session_s = max(float(df_raw["time_s"].max()), 1.0)
-    geom = session_geom_equal_split(session_s, N_SEG_DEFAULT)
-    segment_layout_caption = (
-        f"Segmenty: **{geom.n_seg}** równych bloków czasu (brak pliku `.vmrk` lub brak markerów **New Segment**)."
-    )
+    if case_seg_starts_s:
+        geom = session_geom_from_marker_starts(session_s, case_seg_starts_s)
+        segment_layout_caption = (
+            f"Segmenty: **{geom.n_seg}** odcinków wideo CASE (granice z kolumny `video`)."
+        )
+    else:
+        geom = session_geom_equal_split(session_s, N_SEG_DEFAULT)
+        segment_layout_caption = (
+            f"Segmenty: **{geom.n_seg}** równych bloków czasu (brak pliku `.vmrk` lub brak markerów **New Segment**)."
+        )
     calm_from_log = False
     if loaded_bv and pick_vhdr is not None:
         tlogs = sorted(pick_vhdr.parent.glob("*triggers*.log"))
