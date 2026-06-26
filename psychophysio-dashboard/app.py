@@ -8,6 +8,7 @@ Uruchomienie: py -3 -m streamlit run app.py
 from __future__ import annotations
 
 import html as html_module
+import os
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +58,82 @@ from ecg_qc import (
 import viz_gallery as vg
 
 APP_NAME = "PsyPhy Datalab"
+
+APP_DIR = Path(__file__).resolve().parent
+# Lokalizacja danych. Priorytet: zmienna środowiskowa > plik konfiguracyjny > domyślny `data/`.
+DATA_DIR_ENV = "PSYPHY_DATA_DIR"
+DATA_DIR_CONFIG_FILE = APP_DIR / "data_dir.local"
+DEFAULT_DATA_DIR = APP_DIR / "data"
+
+
+def resolve_data_dir() -> Path:
+    """Zwraca folder z danymi wg priorytetu: env var → plik `data_dir.local` → `data/`.
+
+    Dzięki temu ścieżkę ustawia się **raz** (w UI lub zmienną środowiskową), a aplikacja
+    czyta z niej przy każdym uruchomieniu.
+    """
+    env = os.environ.get(DATA_DIR_ENV, "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_dir():
+            return p
+    if DATA_DIR_CONFIG_FILE.is_file():
+        try:
+            raw = DATA_DIR_CONFIG_FILE.read_text(encoding="utf-8").strip()
+            if raw:
+                p = Path(raw).expanduser()
+                if p.is_dir():
+                    return p
+        except OSError:
+            pass
+    return DEFAULT_DATA_DIR
+
+
+def _render_data_dir_picker() -> Path:
+    """Sidebar: podgląd i ustawienie własnej lokalizacji danych (zapis trwały)."""
+    data_dir = resolve_data_dir()
+    env_override = os.environ.get(DATA_DIR_ENV, "").strip()
+    with st.sidebar.expander("📁 Lokalizacja danych", expanded=False):
+        st.caption(f"Aktualnie używana: `{data_dir}`")
+        if env_override:
+            st.info(
+                f"Ścieżkę wymusza zmienna środowiskowa `{DATA_DIR_ENV}` "
+                "(ma priorytet nad ustawieniem z UI).",
+                icon="🔒",
+            )
+        new_path = st.text_input(
+            "Ścieżka do folderu z danymi",
+            value=str(data_dir),
+            help=(
+                "Wskaż folder, w którym trzymasz dane (CASE: `.../interpolated/physiological`, "
+                "BrainVision: pliki `.vhdr`/`.eeg`). Ustawienie zapisuje się w pliku "
+                "`data_dir.local` (ignorowanym przez Git), więc wystarczy ustawić **raz**."
+            ),
+        )
+        c_save, c_reset = st.columns(2)
+        if c_save.button("Zapisz", key="data_dir_save", use_container_width=True):
+            p = Path(new_path).expanduser()
+            if p.is_dir():
+                try:
+                    DATA_DIR_CONFIG_FILE.write_text(str(p.resolve()), encoding="utf-8")
+                    st.success("Zapisano lokalizację. Odświeżam…")
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"Nie udało się zapisać: {exc}")
+            else:
+                st.error("Taki folder nie istnieje — sprawdź ścieżkę.")
+        if c_reset.button("Domyślny", key="data_dir_reset", use_container_width=True):
+            try:
+                DATA_DIR_CONFIG_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            st.rerun()
+        st.caption(
+            "Alternatywnie ustaw zmienną środowiskową "
+            f"`{DATA_DIR_ENV}=/ścieżka/do/danych` (np. w `.env` lub w systemie)."
+        )
+    return data_dir
+
 
 # Stałe trybów nawigacji (jedno źródło prawdy — radio + logika osi X)
 NAV_FULL = "Pełna sesja"
@@ -580,7 +657,7 @@ def main() -> None:
         st.session_state.cursor_s = 120.0
 
     seed = st.sidebar.number_input("Ziarno RNG (sygnały syntetyczne)", value=42, step=1)
-    data_dir = Path(__file__).resolve().parent / "data"
+    data_dir = _render_data_dir_picker()
 
     st.sidebar.markdown("**Źródło sygnałów**")
     src = st.sidebar.radio(

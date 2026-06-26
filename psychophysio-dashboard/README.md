@@ -44,6 +44,15 @@ To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC n
 
 Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhdr` z listy (pliki z `data/`), ewentualnie plik transkryptu.
 
+## Lokalizacja danych (własny folder, ustawiany raz)
+
+Domyślnie aplikacja czyta z folderu `data/` obok `app.py`, ale lokalizację można **przestawić raz** na dowolny folder (np. dysk z dużymi danymi poza repo):
+
+- **Z poziomu UI:** sidebar → expander **„📁 Lokalizacja danych”** → wpisz ścieżkę → **Zapisz**. Zapisuje się do pliku `data_dir.local` (w `.gitignore`, czyli per maszyna), więc po następnym uruchomieniu aplikacja czyta z tej samej lokalizacji. Przycisk **„Domyślny”** wraca do `data/`.
+- **Zmienną środowiskową:** `PSYPHY_DATA_DIR=/ścieżka/do/danych` — **ma priorytet** nad ustawieniem z UI (przydatne w CI / na serwerze). Przykład (PowerShell): `setx PSYPHY_DATA_DIR "D:\dane\psyphy"`.
+
+We wskazanym folderze obowiązuje ta sama struktura co w `data/`: BrainVision (`.vhdr`/`.eeg`/`.vmrk`), CASE (`.../interpolated/physiological/sub_*.csv`), transkrypty. Priorytet: **zmienna środowiskowa → `data_dir.local` → domyślny `data/`**.
+
 ## Struktura projektu
 
 | Plik / folder | Opis |
