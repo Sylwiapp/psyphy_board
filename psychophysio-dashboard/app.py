@@ -34,9 +34,11 @@ from session_geom import SessionGeom, session_geom_equal_split, session_geom_fro
 from data_validation import format_report_body, validate_brainvision_dataframe, validate_transcript
 from ecg_qc import (
     CLEAN_METHODS,
+    CORRECT_METHODS,
     NK_AVAILABLE,
     NK_VERSION,
     PEAK_METHODS,
+    PSD_METHODS,
     EcgQcOptions,
     apply_manual_edits,
     clean_ecg,
@@ -792,8 +794,13 @@ def main() -> None:
             "na razie przygotuj pliki i ustal z promotorką kolumny."
         )
 
-    tab_session, tab_gallery, tab_ecg_qc = st.tabs(
-        ["Sesja i transkrypt", "Galeria wizualizacji (warianty)", "QC / preprocessing — ECG"]
+    tab_session, tab_gallery, tab_ecg_qc, tab_multiverse = st.tabs(
+        [
+            "Sesja i transkrypt",
+            "Galeria wizualizacji (warianty)",
+            "QC / preprocessing — ECG",
+            "Multiverse — porównanie pipeline'ów",
+        ]
     )
 
     with tab_session:
@@ -820,6 +827,9 @@ def main() -> None:
             else f"synth_{seed}"
         )
         _render_ecg_qc_tab(df_raw, df_disp, raw_fs_hz, ecg_data_source_key=ecg_src)
+
+    with tab_multiverse:
+        _render_multiverse_tab(df_raw, raw_fs_hz)
 
 
 ECG_PRESETS: dict[str, dict[str, object]] = {
@@ -868,6 +878,7 @@ def _apply_ecg_preset() -> None:
     st.session_state["ecg_qc_clean_method"] = str(p["clean"])
     st.session_state["ecg_qc_peak_method"] = str(p["peak"])
     st.session_state["ecg_qc_fix"] = bool(p["correct"])
+    st.session_state["ecg_qc_corr_method"] = str(p.get("correct_method", "kubios"))
     st.session_state["ecg_qc_powerline"] = float(p["powerline"])
 
 
@@ -1073,6 +1084,301 @@ def rp_corr_pct(rep) -> str:
     return f"{rep.corrected_frac * 100:.2f}%"
 
 
+MULTIVERSE_METRICS: dict[str, str] = {
+    "RMSSD (ms) — ton wagalny": "HRV_RMSSD",
+    "HF (ms²) — RSA / wagalne": "HRV_HF",
+    "SDNN (ms) — zmienność całkowita": "HRV_SDNN",
+    "pNN50 (%)": "HRV_pNN50",
+    "Średnie RR (ms)": "HRV_MeanNN",
+    "LF (ms²)": "HRV_LF",
+    "LF/HF": "HRV_LFHF",
+}
+
+
+@st.cache_data(show_spinner=False)
+def _multiverse_run(
+    x_all: np.ndarray,
+    fs: float,
+    clean_methods: tuple[str, ...],
+    peak_methods: tuple[str, ...],
+    corr_variants: tuple[str, ...],
+    metric_col: str,
+    psd_method: str,
+) -> pd.DataFrame:
+    """Liczy wybraną metrykę HRV dla każdej kombinacji (clean × detektor × korekcja).
+
+    `corr_variants` to etykiety: "off" | "kubios" | "neurokit". `psd_method` (welch/burg/
+    lomb) wpływa tylko na metryki częstotliwościowe. Jeden wiersz = jeden pipeline;
+    NaN = brak sensownego wyniku (za mało pików / metryka niedostępna dla tej długości).
+    """
+    rows: list[dict[str, object]] = []
+    for clean_m in clean_methods:
+        for peak_m in peak_methods:
+            for corr in corr_variants:
+                opt = EcgQcOptions(
+                    clean_method=clean_m,
+                    peak_method=peak_m,
+                    correct_artifacts=(corr != "off"),
+                    correct_method=("kubios" if corr == "off" else corr),
+                )
+                value = float("nan")
+                n_peaks = 0
+                try:
+                    cleaned = clean_ecg(x_all, fs, opt)
+                    rpk = detect_r_peaks(cleaned, fs, opt)
+                    n_peaks = int(rpk.peaks.size)
+                    if n_peaks >= 4:
+                        hrv = compute_hrv_metrics(rpk.peaks, fs, psd_method=psd_method)
+                        if not hrv.empty and metric_col in hrv.columns:
+                            value = float(hrv.iloc[0][metric_col])
+                except Exception:  # noqa: BLE001
+                    pass
+                rows.append(
+                    {
+                        "clean": clean_m,
+                        "detektor": peak_m,
+                        "korekcja": corr,
+                        "wartość": value,
+                        "n_peaks": n_peaks,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _render_multiverse_tab(df_raw: pd.DataFrame, raw_fs_hz: float) -> None:
+    """Zakładka: porównanie wyniku HRV w wielu pipeline'ach (analiza multiverse)."""
+    st.subheader("Multiverse — jak wybór pipeline'u wpływa na wynik HRV")
+    st.info(
+        "Liczymy **tę samą metrykę HRV dla wielu kombinacji** decyzji preprocessingowych "
+        "(metoda czyszczenia × detektor R × korekcja artefaktów) na **bieżącym** sygnale ECG. "
+        "Wykres rozrzutu (*specification curve*) pokazuje, **czy wynik jest odporny**, a wykresy "
+        "pudełkowe — **która decyzja najmocniej go przesuwa**. To ilustruje wpływ preprocessingu "
+        "na wynik — sedno pracy o porównaniu metod.",
+        icon="🔬",
+    )
+    if not NK_AVAILABLE:
+        st.error("NeuroKit2 niedostępny — multiverse wymaga NK2 (`pip install neurokit2`).")
+        return
+
+    t_all, x_all = extract_ecg_series(df_raw)
+    if x_all.size < 10:
+        st.info("Brak sygnału `ecg_mv` w bieżącym źródle.")
+        return
+    fs = float(estimate_fs_from_time(t_all) or 0.0)
+    if fs <= 0:
+        fs = float(raw_fs_hz)
+    dur_min = (float(t_all[-1] - t_all[0]) / 60.0) if t_all.size else 0.0
+    st.caption(
+        f"Sygnał: {x_all.size:,} próbek · Fs≈{fs:.0f} Hz · ~{dur_min:.1f} min. "
+        "Najlepiej uruchamiać na **jednym segmencie** (np. wideo CASE) — całą sesję liczy się długo."
+    )
+
+    metric_label = st.selectbox("Metryka do porównania", list(MULTIVERSE_METRICS.keys()))
+    metric_col = MULTIVERSE_METRICS[metric_label]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        clean_sel = st.multiselect(
+            "Metody czyszczenia (Etap 2)",
+            options=list(CLEAN_METHODS),
+            default=[
+                m for m in ("neurokit", "pantompkins1985", "hamilton2002", "none")
+                if m in CLEAN_METHODS
+            ],
+        )
+    with c2:
+        peak_sel = st.multiselect(
+            "Detektory R (Etap 3)",
+            options=list(PEAK_METHODS),
+            default=[m for m in ("neurokit", "kalidas2017") if m in PEAK_METHODS],
+        )
+    c3, c4 = st.columns(2)
+    with c3:
+        corr_sel = st.multiselect(
+            "Korekcja artefaktów (Etap 5)",
+            options=["off", "kubios", "neurokit"],
+            default=["off", "kubios"],
+            help=(
+                "off = brak korekcji · kubios = Lipponen–Tarvainen 2019 · "
+                "neurokit = iteracyjna korekcja progowa RR."
+            ),
+        )
+    with c4:
+        psd_method = st.selectbox(
+            "Metoda PSD (dla HF/LF/VLF)",
+            options=list(PSD_METHODS),
+            help=(
+                "welch = FFT (domyślna) · burg = AR (Task Force 1996) · "
+                "lomb = Lomb–Scargle (wymaga `astropy`). Wpływa tylko na metryki "
+                "częstotliwościowe; RMSSD/SDNN bez zmian."
+            ),
+        )
+
+    if not clean_sel or not peak_sel or not corr_sel:
+        st.warning(
+            "Wybierz co najmniej jedną metodę czyszczenia, jeden detektor i jeden wariant korekcji."
+        )
+        return
+    n_combos = len(clean_sel) * len(peak_sel) * len(corr_sel)
+    st.caption(f"Liczba pipeline'ów do policzenia: **{n_combos}**.")
+    if n_combos > 60:
+        st.warning("Dużo kombinacji — policzenie może chwilę potrwać.")
+
+    if st.button("▶ Uruchom multiverse", type="primary"):
+        with st.spinner(f"Liczę {n_combos} pipeline'ów…"):
+            res = _multiverse_run(
+                x_all,
+                fs,
+                tuple(clean_sel),
+                tuple(peak_sel),
+                tuple(corr_sel),
+                metric_col,
+                str(psd_method),
+            )
+        st.session_state["multiverse_result"] = (res, metric_label)
+
+    if "multiverse_result" not in st.session_state:
+        st.info("Ustaw opcje powyżej i kliknij **▶ Uruchom multiverse**.")
+        return
+
+    res, res_label = st.session_state["multiverse_result"]
+    valid = res.dropna(subset=["wartość"])
+    if valid.empty:
+        st.warning("Żaden pipeline nie dał wyniku (za krótki sygnał / za mało pików).")
+        return
+
+    vals = valid["wartość"].to_numpy(dtype=float)
+    med = float(np.median(vals))
+    cv = (float(np.std(vals)) / float(np.mean(vals)) * 100.0) if np.mean(vals) else float("nan")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Pipeline'ów (OK)", f"{len(valid)}/{len(res)}")
+    m2.metric("Mediana", f"{med:.3g}")
+    m3.metric("Min–max", f"{vals.min():.3g} – {vals.max():.3g}")
+    m4.metric("Rozrzut (CV%)", f"{cv:.1f}%" if np.isfinite(cv) else "—")
+
+    st.markdown(f"**Specification curve — {res_label}**")
+    st.caption(
+        "Każdy punkt = jeden pipeline, posortowane rosnąco. Płaska krzywa = wynik **odporny** "
+        "na wybór metody; duży rozrzut = wynik **silnie zależny** od preprocessingu. "
+        "Kolor = metoda czyszczenia."
+    )
+    sc = valid.sort_values("wartość").reset_index(drop=True)
+    fig = go.Figure()
+    for clean_m in sc["clean"].unique():
+        sub = sc[sc["clean"] == clean_m]
+        fig.add_trace(
+            go.Scatter(
+                x=sub.index,
+                y=sub["wartość"],
+                mode="markers",
+                name=clean_m,
+                marker=dict(size=9),
+                customdata=np.stack([sub["detektor"], sub["korekcja"]], axis=-1),
+                hovertemplate=(
+                    "clean=%{fullData.name}<br>detektor=%{customdata[0]}"
+                    "<br>korekcja=%{customdata[1]}<br>" + res_label + "=%{y:.3g}<extra></extra>"
+                ),
+            )
+        )
+    fig.add_hline(y=med, line_dash="dash", line_color="gray", annotation_text="mediana")
+    fig.update_xaxes(title_text="Pipeline (posortowany)")
+    fig.update_yaxes(title_text=res_label)
+    fig.update_layout(height=340, legend=dict(orientation="h", y=1.02))
+    st.plotly_chart(fig, use_container_width=True, key="multiverse_speccurve")
+
+    st.markdown("**Która decyzja najmocniej przesuwa wynik?**")
+    st.caption(
+        "Rozkład metryki w podziale na poziomy każdej decyzji. Im bardziej pudełka się "
+        "rozjeżdżają, tym większy wpływ danej decyzji na wynik."
+    )
+    fcols = st.columns(3)
+    factor_spread: list[tuple[str, float]] = []
+    for ax, factor in zip(fcols, ["clean", "detektor", "korekcja"]):
+        figf = go.Figure()
+        means: list[float] = []
+        for lvl in valid[factor].unique():
+            yv = valid[valid[factor] == lvl]["wartość"].to_numpy(dtype=float)
+            figf.add_trace(go.Box(y=yv, name=str(lvl), boxpoints="all", jitter=0.4))
+            means.append(float(np.mean(yv)))
+        spread = (max(means) - min(means)) if len(means) >= 2 else 0.0
+        factor_spread.append((factor, spread))
+        figf.update_layout(
+            height=300, showlegend=False, title=dict(text=factor, x=0.5),
+            margin=dict(l=30, r=10, t=40, b=30),
+        )
+        figf.update_yaxes(title_text=res_label if factor == "clean" else None)
+        ax.plotly_chart(figf, use_container_width=True, key=f"multiverse_box_{factor}")
+
+    factor_spread.sort(key=lambda kv: kv[1], reverse=True)
+    ranking = " > ".join(
+        f"**{f}** (Δśrednich {s:.3g})" for f, s in factor_spread if s > 0
+    )
+    if ranking:
+        st.caption(f"Wpływ decyzji na wynik (malejąco): {ranking}.")
+
+    st.markdown("**Pełna tabela pipeline'ów**")
+    st.dataframe(
+        res.sort_values("wartość", na_position="last").reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "Wynik dotyczy **bieżącego segmentu/sesji**. Po zmianie danych w panelu bocznym "
+        "uruchom multiverse ponownie. Interpretacja: szukaj wniosku **odpornego** na wybór "
+        "pipeline'u (Steegen i in. 2016; sensitivity/multiverse analysis)."
+    )
+
+
+def _hrv_validity_table(duration_s: float, metric_cols: list[str]) -> pd.DataFrame:
+    """Per-metryka ocena wiarygodności dla danej długości okna (krótkoczasowe HRV).
+
+    Progi orientacyjne (s) wg Task Force (1996), PLOS One (2015), Shaffer (2020):
+    metryki czasowe i HF ~60 s, LF/LFHF ~120 s. MeanNN praktycznie zawsze.
+    Status: wiarygodne (>= próg), ostrożnie (>= 0.5*próg), niewiarygodne (poniżej).
+    """
+    min_s: dict[str, float] = {
+        # krótkoczasowe
+        "HRV_MeanNN": 10.0,
+        "HRV_SDNN": 60.0,
+        "HRV_RMSSD": 60.0,
+        "HRV_pNN50": 60.0,
+        "HRV_SD1": 60.0,
+        "HRV_HF": 60.0,
+        "HRV_LF": 120.0,
+        "HRV_LFHF": 120.0,
+        "HRV_TP": 120.0,
+        # długoczasowe / dobowe
+        "HRV_VLF": 300.0,
+        "HRV_SD2": 300.0,
+        "HRV_SDANN1": 300.0,
+        "HRV_SDNNI1": 300.0,
+        "HRV_DFA_alpha1": 300.0,
+        "HRV_HTI": 1200.0,
+        "HRV_TINN": 1200.0,
+        "HRV_DFA_alpha2": 1200.0,
+        "HRV_ULF": 86400.0,
+    }
+    rows: list[dict[str, str]] = []
+    for col in metric_cols:
+        thr = min_s.get(col)
+        if thr is None:
+            continue  # pokazujemy tylko metryki z ustalonym progiem
+        if duration_s >= thr:
+            status = "✅ wiarygodne"
+        elif duration_s >= 0.5 * thr:
+            status = "⚠️ ostrożnie"
+        else:
+            status = "❌ niewiarygodne"
+        rows.append(
+            {
+                "Metryka": col.replace("HRV_", ""),
+                "Min. zalecana długość": f"~{thr:.0f} s",
+                "Status (to okno)": status,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _render_ecg_qc_tab(
     df_raw: pd.DataFrame,
     df_disp: pd.DataFrame,
@@ -1081,6 +1387,13 @@ def _render_ecg_qc_tab(
 ) -> None:
     """Zakładka: preprocess + QC toru ECG (`ecg_mv`) z użyciem NeuroKit2."""
     st.subheader("QC / preprocessing — ECG (`ecg_mv`)")
+    st.info(
+        "**Zakres narzędzia.** To dydaktyczny dodatek pokazujący *fizycznie*, jak poszczególne "
+        "decyzje preprocessingu (filtracja, detektor R, korekcja artefaktów) zmieniają sygnał i "
+        "wynikowe metryki HRV. **Nie** jest to kliniczny pipeline HRV: nie obsługuje arytmii/"
+        "ektopii klinicznie, nie zastępuje opisu metody w publikacji ani procedur laboratoryjnych.",
+        icon="ℹ️",
+    )
     st.caption(
         "Tor w aplikacji jako **ecg_mv** (w BV często drugi pas oddechu — sprawdź nagłówek). "
         "Cały pipeline opiera się na **NeuroKit2** (czyszczenie, detekcja R, korekcja artefaktów "
@@ -1151,10 +1464,19 @@ def _render_ecg_qc_tab(
         ("ecg_qc_clean_method", str(ECG_PRESETS[ECG_DEFAULT_PRESET]["clean"])),
         ("ecg_qc_peak_method", str(ECG_PRESETS[ECG_DEFAULT_PRESET]["peak"])),
         ("ecg_qc_fix", bool(ECG_PRESETS[ECG_DEFAULT_PRESET]["correct"])),
+        ("ecg_qc_corr_method", "kubios"),
+        ("ecg_qc_psd_method", "welch"),
         ("ecg_qc_powerline", float(ECG_PRESETS[ECG_DEFAULT_PRESET]["powerline"])),
     ):
         st.session_state.setdefault(k, default)
 
+    st.markdown("---")
+    st.markdown("#### Konfiguracja pipeline'u (Etapy 2–6)")
+    st.caption(
+        "To **osobna, globalna** konfiguracja — niezależna od kontroli wzrokowej (Etap 1) powyżej. "
+        "Preset wpisuje **spójny zestaw** ustawień do wszystkich etapów naraz; **każde pole "
+        "możesz potem nadpisać ręcznie** w sekcjach Etap 2–6 (preset nie blokuje zmian)."
+    )
     st.selectbox(
         "Preset preprocessingu",
         options=list(ECG_PRESETS.keys()),
@@ -1186,6 +1508,7 @@ def _render_ecg_qc_tab(
         clean_method=str(st.session_state["ecg_qc_clean_method"]),
         peak_method=str(st.session_state["ecg_qc_peak_method"]),
         correct_artifacts=bool(st.session_state["ecg_qc_fix"]),
+        correct_method=str(st.session_state["ecg_qc_corr_method"]),
         powerline_hz=float(st.session_state["ecg_qc_powerline"]),
         rr_min_ms=rr_a,
         rr_max_ms=rr_b,
@@ -1572,11 +1895,23 @@ def _render_ecg_qc_tab(
         s5_d1, s5_d2 = st.columns(2)
         with s5_d1:
             st.checkbox(
-                "Korekcja artefaktów RR (Lipponen–Tarvainen 2019, „Kubios” w NK2)",
+                "Korekcja artefaktów RR",
                 key="ecg_qc_fix",
                 help=(
                     "Klasyfikator i poprawki RR: ectopic / missed / extra / longshort. "
                     "Zalecane przy nagraniach z ruchem; wyłącz, gdy chcesz „surowe” piki NK2."
+                ),
+            )
+            st.selectbox(
+                "Metoda korekcji",
+                options=list(CORRECT_METHODS),
+                key="ecg_qc_corr_method",
+                disabled=not bool(st.session_state.get("ecg_qc_fix", True)),
+                help=(
+                    "**kubios** — Lipponen–Tarvainen 2019: klasyfikuje i poprawia ektopie, "
+                    "brakujące/nadmiarowe R oraz pary long–short (domyślna, zalecana). "
+                    "**neurokit** — iteracyjna korekcja progowa odstępów RR (prostsza; "
+                    "wykrywa głównie extra/missed). Porównanie obu = dobry materiał do pracy."
                 ),
             )
         with s5_d2:
@@ -1666,7 +2001,7 @@ def _render_ecg_qc_tab(
         if pk_c.size:
             fig_s5.add_trace(go.Scatter(
                 x=t_all[pk_c], y=x_filt[pk_c], mode="markers",
-                name="R po korekcji RR (LT19)",
+                name=f"R po korekcji RR ({opt.correct_method})",
                 marker=dict(size=8, color="red", symbol="x"),
                 hovertemplate="t=%{x:.3f}s<extra></extra>",
             ))
@@ -1689,13 +2024,20 @@ def _render_ecg_qc_tab(
     st.plotly_chart(fig_s5, use_container_width=True, key="ecg_s5_fig_time")
 
     if rp.n_corrections > 0 or rp.peaks_uncorrected.size != rp.peaks.size:
+        _corr_lbl = (
+            "Lipponen–Tarvainen 2019 / „Kubios”"
+            if str(opt.correct_method).lower() == "kubios"
+            else "iteracyjna progowa („neurokit”)"
+        )
         with st.expander(
-            f"Co zrobił automat (korekcja RR — Lipponen–Tarvainen 2019): "
+            f"Co zrobił automat (korekcja RR — {_corr_lbl}): "
             f"{rp.n_corrections} zmian",
             expanded=False,
         ):
             st.caption(
-                "Typy korekt z algorytmu **Kubios / LT19**. Indeksy odnoszą się do "
+                f"Typy korekt z metody **{opt.correct_method}** "
+                "(metoda `neurokit` raportuje głównie *extra/missed*). "
+                "Indeksy odnoszą się do "
                 "**oryginalnej** (nieskorygowanej) listy R-peaków:\n"
                 "- **ectopic** — uderzenie ektopowe: pozycja R została poprawiona,\n"
                 "- **missed** — automat dodał brakujący R,\n"
@@ -1997,24 +2339,51 @@ def _render_ecg_qc_tab(
     elif rep.n_peaks < 4:
         st.info("Za mało pików (< 4) — dodaj/popraw R w Etapie 5.")
     else:
-        with st.spinner("Liczę HRV (czas + częstotliwość)…"):
-            hrv_df = compute_hrv_metrics(peaks, fs_use)
+        psd_method = st.selectbox(
+            "Metoda estymacji widma (PSD) — dla metryk częstotliwościowych (HF/LF/VLF)",
+            options=list(PSD_METHODS),
+            key="ecg_qc_psd_method",
+            help=(
+                "**welch** — FFT z uśrednianiem okien (domyślna). "
+                "**burg** — model autoregresyjny (AR): gładsze widmo, lepsze na krótkich "
+                "oknach; Task Force 1996 zaleca raportować obok FFT. "
+                "**lomb** — Lomb–Scargle: liczy widmo bez interpolacji RR (wymaga `astropy`). "
+                "Metryki czasowe (RMSSD, SDNN) **nie** zależą od tego wyboru."
+            ),
+        )
+        with st.spinner(f"Liczę HRV (czas + częstotliwość, PSD={psd_method})…"):
+            hrv_df = compute_hrv_metrics(peaks, fs_use, psd_method=psd_method)
         if hrv_df.empty:
             st.info("NK2 nie zwrócił metryk (nagranie zbyt krótkie?).")
         else:
-            main_cols = [
-                c
-                for c in (
-                    "HRV_MeanNN",
-                    "HRV_SDNN",
-                    "HRV_RMSSD",
-                    "HRV_pNN50",
-                    "HRV_LF",
-                    "HRV_HF",
-                    "HRV_LFHF",
-                )
-                if c in hrv_df.columns
-            ]
+            metric_set = st.radio(
+                "Zestaw metryk",
+                ["Krótkoczasowe (zalecane)", "Długoczasowe / dobowe", "Wszystkie"],
+                horizontal=True,
+                key="ecg_qc_metric_set",
+                help=(
+                    "Krótkoczasowe: właściwe dla okien ≤ 5 min (Twój przypadek). "
+                    "Długoczasowe: metryki sensowne dopiero dla nagrań wielominutowych–dobowych "
+                    "(SDANN, VLF/ULF, DFA, indeks trójkątny) — pokazywane do porównania, ale "
+                    "tabela niżej oznaczy ich (nie)wiarygodność dla bieżącego okna."
+                ),
+            )
+            short_metrics = (
+                "HRV_MeanNN", "HRV_SDNN", "HRV_RMSSD", "HRV_pNN50",
+                "HRV_LF", "HRV_HF", "HRV_LFHF",
+            )
+            long_metrics = (
+                "HRV_SDNN", "HRV_SDANN1", "HRV_SDNNI1", "HRV_VLF", "HRV_ULF",
+                "HRV_TP", "HRV_HTI", "HRV_TINN", "HRV_SD2",
+                "HRV_DFA_alpha1", "HRV_DFA_alpha2",
+            )
+            if metric_set.startswith("Krótko"):
+                wanted = short_metrics
+            elif metric_set.startswith("Długo"):
+                wanted = long_metrics
+            else:
+                wanted = tuple(hrv_df.columns)
+            main_cols = [c for c in wanted if c in hrv_df.columns]
             if main_cols:
                 st.dataframe(
                     hrv_df[main_cols].T.rename(columns={0: "wartość"}),
@@ -2025,12 +2394,28 @@ def _render_ecg_qc_tab(
                     hrv_df.T.rename(columns={0: "wartość"}),
                     use_container_width=True,
                 )
+
+            st.markdown("**Wiarygodność metryk dla tej długości okna**")
+            dur_s = float(rep.duration_min) * 60.0
+            validity_df = _hrv_validity_table(dur_s, [c for c in main_cols])
+            st.dataframe(validity_df, use_container_width=True, hide_index=True)
+            st.caption(
+                f"Długość okna: **{dur_s:.0f} s** (~{rep.duration_min:.1f} min). Progi orientacyjne: "
+                "RMSSD/SDNN/pNN50/HF ~60 s, LF/TP ~120 s, VLF/SDANN/DFA-α1 ~300 s, "
+                "indeks trójkątny/TINN/DFA-α2 ~20 min, ULF ~24 h. Metryki długoczasowe są dostępne "
+                "(zestaw „Długoczasowe/dobowe”), ale dla krótkiego okna tabela oznaczy je ❌/⚠️. "
+                "**SDNN** rośnie z długością nagrania — nie porównuj go między oknami o różnym "
+                "czasie trwania (Task Force 1996; Shaffer 2020)."
+            )
             st.caption(
                 "Laborde 2017: do tonu wagalnego preferować **RMSSD** lub **HF**; "
                 "unikać `LF/HF` jako miary „balansu”. Pasma: HF 0.15–0.40 Hz, "
                 "LF 0.04–0.15 Hz, VLF 0.0033–0.04 Hz (Task Force 1996). "
-                f"Sesja {rep.duration_min:.1f} min — pamiętaj o wymaganiach długości epok "
-                "(LF od ~120 s, ULF od godzin)."
+                "**Uwaga interpretacyjna:** HF to w istocie rytm zatokowo-oddechowy (RSA) i "
+                "**zależy od częstości/głębokości oddechu** — nie jest „czystym” wskaźnikiem "
+                "wagalnym (Grossman & Taylor 2007; Laborde 2017). Jeśli porównujesz warunki, "
+                "sprawdź, czy oddech mieści się w 9–24/min i nie różni się między nimi; RMSSD jest "
+                "mniej wrażliwe na oddech niż HF."
             )
 
 
@@ -2109,6 +2494,11 @@ def _render_session_tab(
     st.caption(
         "Wszystkie sygnały na **jednej** osi Y po normalizacji min–max (porównanie kształtu). "
         "Czas ustawiasz **suwakiem** bezpośrednio pod wykresem."
+    )
+    st.caption(
+        "Uwaga: znaczenie toru **`puls_bpm`** zależy od źródła — syntetyczne: wartość zbliżona "
+        "do BPM; BrainVision: sygnał µV z rekordera (nie BPM); **CASE: przebieg BVP/PPG (nie BPM)**. "
+        "Detekcja pulsu z BVP/PPG jest mniej dokładna niż z ECG (Quigley 2024)."
     )
     overlay_src = st.radio(
         "Źródło nakładki",

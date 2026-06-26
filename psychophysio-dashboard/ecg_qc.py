@@ -61,6 +61,28 @@ PEAK_METHODS: tuple[str, ...] = (
     "promac",
 )
 
+# Metody korekcji artefaktów RR (Etap 5). `kubios` = Lipponen–Tarvainen 2019
+# (klasyfikuje ectopic/missed/extra/longshort), `neurokit` = iteracyjna korekcja
+# progowa odstępów RR (interval-based) wbudowana w NK2.
+CORRECT_METHODS: tuple[str, ...] = ("kubios", "neurokit")
+
+
+def _astropy_available() -> bool:
+    try:
+        import astropy  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Metody estymacji widma (PSD) dla HRV częstotliwościowego (Etap 7).
+# welch = FFT z oknami (domyślna), burg = autoregresyjna (AR; Task Force 1996),
+# lomb = Lomb–Scargle (bez interpolacji RR; wymaga pakietu `astropy`).
+PSD_METHODS: tuple[str, ...] = ("welch", "burg") + (
+    ("lomb",) if _astropy_available() else ()
+)
+
 
 @dataclass(frozen=True)
 class EcgQcOptions:
@@ -69,6 +91,7 @@ class EcgQcOptions:
     clean_method: str = "neurokit"
     peak_method: str = "neurokit"
     correct_artifacts: bool = True
+    correct_method: str = "kubios"  # metoda korekcji RR: kubios | neurokit
     powerline_hz: float = 50.0
 
     rr_min_ms: float = 300.0
@@ -204,33 +227,50 @@ def detect_r_peaks(
     if s.size < int(2 * fs) or fs <= 0 or not NK_AVAILABLE:
         return empty
     try:
+        # Detekcja bez korekcji — zawsze mamy „surowe” piki jako punkt odniesienia.
         _df, info = nk.ecg_peaks(
             s,
             sampling_rate=float(fs),
             method=opt.peak_method,
-            correct_artifacts=bool(opt.correct_artifacts),
+            correct_artifacts=False,
         )
-        peaks = np.asarray(info.get("ECG_R_Peaks", []), dtype=int)
-        uncorr = np.asarray(
-            info.get("ECG_R_Peaks_Uncorrected", peaks), dtype=int
-        )
+        uncorr = np.asarray(info.get("ECG_R_Peaks", []), dtype=int)
+        peaks = uncorr
+        fixes: dict[str, np.ndarray] = {
+            "ectopic": np.array([], dtype=int),
+            "missed": np.array([], dtype=int),
+            "extra": np.array([], dtype=int),
+            "longshort": np.array([], dtype=int),
+        }
 
-        def _arr(k: str) -> np.ndarray:
-            v = info.get(k)
-            if v is None:
-                return np.array([], dtype=int)
-            try:
-                return np.asarray(list(v), dtype=int)
-            except (TypeError, ValueError):
-                return np.array([], dtype=int)
+        if bool(opt.correct_artifacts) and uncorr.size >= 4:
+            # Wybór metody korekcji RR (Etap 5).
+            method = (
+                "Kubios"
+                if str(opt.correct_method).lower() == "kubios"
+                else "neurokit"
+            )
+            fix_info, peaks_clean = nk.signal_fixpeaks(
+                uncorr, sampling_rate=float(fs), method=method
+            )
+            peaks = np.asarray(peaks_clean, dtype=int)
+            if isinstance(fix_info, dict):
+                for k in fixes:
+                    v = fix_info.get(k)
+                    if v is None:
+                        continue
+                    try:
+                        fixes[k] = np.asarray(list(v), dtype=int)
+                    except (TypeError, ValueError):
+                        pass
 
         return RPeaksResult(
             peaks=peaks,
             peaks_uncorrected=uncorr,
-            fixes_ectopic=_arr("ECG_fixpeaks_ectopic"),
-            fixes_missed=_arr("ECG_fixpeaks_missed"),
-            fixes_extra=_arr("ECG_fixpeaks_extra"),
-            fixes_longshort=_arr("ECG_fixpeaks_longshort"),
+            fixes_ectopic=fixes["ectopic"],
+            fixes_missed=fixes["missed"],
+            fixes_extra=fixes["extra"],
+            fixes_longshort=fixes["longshort"],
         )
     except Exception:  # noqa: BLE001
         return empty
@@ -687,10 +727,14 @@ def compute_ecg_qc_report(
     )
 
 
-def compute_hrv_metrics(peaks_idx: np.ndarray, fs: float) -> pd.DataFrame:
+def compute_hrv_metrics(
+    peaks_idx: np.ndarray, fs: float, psd_method: str = "welch"
+) -> pd.DataFrame:
     """One-row DataFrame with NK2 HRV metrics (time + frequency when possible).
 
-    Returns empty DataFrame on too-short recordings / NK2 unavailable.
+    `psd_method` steruje estymacją widma dla metryk częstotliwościowych
+    (welch | burg | lomb). Returns empty DataFrame on too-short recordings /
+    NK2 unavailable.
     """
     if not NK_AVAILABLE or peaks_idx.size < 4 or fs <= 0:
         return pd.DataFrame()
@@ -703,9 +747,23 @@ def compute_hrv_metrics(peaks_idx: np.ndarray, fs: float) -> pd.DataFrame:
     except Exception:  # noqa: BLE001
         pass
     try:
-        hf = nk.hrv_frequency(peaks_idx, sampling_rate=float(fs), show=False)
+        hf = nk.hrv_frequency(
+            peaks_idx,
+            sampling_rate=float(fs),
+            show=False,
+            psd_method=str(psd_method),
+        )
         for c in hf.columns:
             v = hf.iloc[0][c]
+            out[c] = float(v) if pd.notna(v) else float("nan")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Metryki nieliniowe (Poincaré SD1/SD2, DFA alpha1/alpha2) — głównie dla
+        # nagrań dłuższych; dla krótkich okien część zwróci NaN (to oczekiwane).
+        hn = nk.hrv_nonlinear(peaks_idx, sampling_rate=float(fs))
+        for c in hn.columns:
+            v = hn.iloc[0][c]
             out[c] = float(v) if pd.notna(v) else float("nan")
     except Exception:  # noqa: BLE001
         pass
