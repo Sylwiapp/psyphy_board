@@ -26,18 +26,47 @@ The pictures below are the synthetic 60-minute demo (seed 42), so the ECG is a g
 
 ## What you can do
 
-Four tabs share the signal chosen in the sidebar.
+Four tabs share the signal chosen in the sidebar. Names below are the Polish labels in the app.
 
 | Tab | What it shows |
 | --- | --- |
-| **Session and transcript** | Four time series, raw and smoothed. A min–max overlay, a time cursor, and a transcript that highlights the utterance under the cursor. |
-| **Visualization gallery** | Segment summaries, distributions, correlations, spectrograms, a simple tonic/phasic EDA split, and rolling pulse variability. |
-| **ECG QC / preprocessing** | NeuroKit2 cleaning, R-peak detection, RR correction, a quality summary, and short-term HRV. Presets include NeuroKit, Pan–Tompkins (1985), Hamilton (2002), and Elgendi (2010). |
-| **Multiverse** | The same HRV metric across many cleaning × detector × artifact-correction choices, drawn as a specification curve. |
+| **Sesja i transkrypt** | Min–max overlay of four channels, then stacked raw and smoothed traces, a time cursor, and a transcript that highlights the utterance under the cursor. |
+| **Galeria wizualizacji (warianty)** | Three inner tabs: segment summaries; distributions, correlations, and a state-space view; spectrograms, a tonic/phasic EDA split, and rolling pulse variability. |
+| **QC / preprocessing — ECG** | Seven stages on the `ecg_mv` column, from looking at the raw trace through short-term HRV. Presets: NeuroKit, Pan–Tompkins (1985), Hamilton (2002), Elgendi (2010). |
+| **Multiverse — porównanie pipeline'ów** | The same HRV metric across cleaning × R-detector × artifact-correction choices, drawn as a specification curve. Press **Uruchom multiverse**. On a full hour this is slow; a single CASE video is the practical length. |
 
-Long, high-rate recordings are drawn with a **min/max envelope** so Plotly stays under Streamlit’s message-size limit. The shape of the session stays visible; the on-screen trace is not every raw sample.
+Long, high-rate recordings are drawn with a **min/max envelope** (the full-session overlay in the first screenshot is that envelope, not every sample). The shape of the session stays visible.
 
 `eda_qc.py` and `rsp_qc.py` are library modules (NeuroKit2 wrappers for EDA and the two respiration belts). They are not wired into a tab yet.
+
+### Sidebar
+
+| Control | What it does |
+| --- | --- |
+| **Ziarno RNG** | Seed for the synthetic demo. |
+| **Lokalizacja danych** | Folder the app reads. **Zapisz** writes `data_dir.local`. **Domyślny** returns to `data/`. |
+| **Źródło sygnałów** | **Syntetyczne (demo)**, **BrainVision**, or **CASE**. |
+| **Transkrypt** | **Wczytaj transkrypt z pliku** uploads JSON or CSV. **Dopisz przykład…** appends `data/transcript.example.json`. |
+| **Nawigacja po czasie** | **Pełna sesja**, **Okno wokół kursora** (width 30–900 s; the second screenshot is 120 s), or **Wybrany segment**. |
+| **Kwestionariusze (planowane)** | Placeholder. Questionnaire CSVs are not loaded yet. |
+
+### Session tab
+
+The overlay has its own source switch, **Przetworzone** (~4 Hz, smoothed) or **Surowe**. Under it, a slider sets the time cursor (red line). **Surowe próbki** and **Widok przetworzony** are the stacked traces beside the transcript.
+
+### ECG tab
+
+The pipeline always runs on the raw `ecg_mv` series, never on the ~4 Hz display trace.
+
+| Stage | What you set |
+| --- | --- |
+| 1 | Visual check of the raw signal, before any filter. |
+| 2 | Cleaning method and power-line frequency (50 or 60 Hz). The fourth screenshot is this stage. |
+| 3 | R-peak detector. |
+| 4 | Signal-quality index against a QRS template. |
+| 5 | RR artifact correction, plus manual add/remove of peaks by time in seconds. |
+| 6 | Window length and exclusion rule, then a QC report and a methods paragraph you can copy. |
+| 7 | Short-term HRV on the final peak list. |
 
 ## Requirements
 
@@ -62,7 +91,7 @@ py -3 -m pip install -r requirements.txt
 py -3 -m streamlit run app.py
 ```
 
-The app opens at `http://localhost:8501`. The sidebar chooses the signal source, the optional transcript, and how the time axis is shown: full session, a window around the cursor, or one segment.
+The app opens at `http://localhost:8501`.
 
 ## Where data lives
 
