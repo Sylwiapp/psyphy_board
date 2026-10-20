@@ -1,120 +1,209 @@
 # PsyPhy Datalab
 
-Dashboard w **Streamlit** do przeglądania w czasie sygnałów psychofizjologicznych (oddech, EDA, tor HR itd.) wraz z **transkryptem** — pod eksplorację pojedynczej sesji i przygotowanie pod dalszą analizę (m.in. psychofizjolingwistyka, cognitive science).
+Streamlit dashboard for exploring one psychophysiological session together with its transcript. It is built for exploratory work in psychophysiology and psychophysiolinguistics: respiration, electrodermal activity (EDA), a heart-rate or pulse trace, and — when the recording actually contains it — ECG and short-term heart-rate variability (HRV).
 
-To **prototyp**: kod i interfejs mogą się zmieniać; wykresy i heurystyki QC nie zastępują opisu metody w publikacji ani procedur w laboratorium.
+This is a **prototype**. Plots, filters, and quality checks are heuristics for exploration. They do not replace a methods section, a lab protocol, or a clinical HRV pipeline. The interface is currently in **Polish**.
 
-## Funkcje
+## What you can do
 
-- **Źródło danych:** tryb **syntetyczny** (demo), **BrainVision** — pliki `.vhdr` + `.eeg` w folderze `data/` (rekurencyjnie, także podfoldery), albo **CASE** (Sharma et al. 2019) — otwarty zbiór z **prawdziwym ECG** (patrz sekcja „Dane CASE” niżej). Ostatnie cztery kanały w typowym zapisie BrainVision 68-kanałowym są mapowane na: oddech (Resp01T), drugi tor oddechu / „ECG” w UI (Resp02B), EDA (GSR), sygnał HR z nagłówka (µV; kolumna w kodzie historycznie `puls_bpm`).
-- **Sesja i transkrypt:** cztery szeregi czasowe (surowe i wersja wygładzona / rzadsza), nakładka po normalizacji min–max, **nawigacja** po osi czasu (cała sesja / okno wokół kursora / **segmenty**), transkrypt w iframe z podświetleniem wg kursora. **Segmenty** przy BrainVision: z **`.vmrk`** — granice z markerów **`New Segment`** (czas z pozycji próbek i Fs z nagłówka). Gdy markery dają **tylko jeden** segment (np. jeden `New Segment` na początku pliku), używany jest **równy podział na 6 bloków** jak przy danych syntetycznych; bez markerów `New Segment` — tak samo **6 równych** bloków.
-- **Walidacja po wczytaniu** (expander): heurystyki dla BV (Fs, NaN, zmienność torów, stałe zera na dodatkowych kanałach) oraz dla transkryptu (przedziały czasu, długość vs sesja, nakładania itd.).
-- **Galeria:** histogramy, korelacje, wykresy po segmentach, spektrogram (z decymacją przy bardzo długich nagraniach), uproszczony podział EDA tonic/phasic, zmienność pulsu w oknach.
-- **QC / preprocessing — ECG:** tor `ecg_mv`, filtracja, detekcja R (heurystyka), histogram RR, krótkie podsumowanie jakości (parametryzowalne progi).
+Four tabs share the signal chosen in the sidebar.
 
-**Uwagi techniczne:** wykresy Plotly używają **decymacji kopertą min/max**, żeby nie przekraczać limitu rozmiaru wiadomości Streamlit przy długich nagraniach wysokiej częstotliwości. Parser `.vhdr` czyta **nazwy i rozdzielczości kanałów tylko z sekcji `[Channel Infos]`** — linie `ChN=…` z sekcji `[Coordinates]` nie nadpisują już skali.
+| Tab | What it shows |
+| --- | --- |
+| **Session and transcript** | Four time series, raw and smoothed. A min–max overlay, a time cursor, and a transcript that highlights the utterance under the cursor. |
+| **Visualization gallery** | Segment summaries, distributions, correlations, spectrograms, a simple tonic/phasic EDA split, and rolling pulse variability. |
+| **ECG QC / preprocessing** | NeuroKit2 cleaning, R-peak detection, RR correction, a quality summary, and short-term HRV. Presets include NeuroKit, Pan–Tompkins (1985), Hamilton (2002), and Elgendi (2010). |
+| **Multiverse** | The same HRV metric across many cleaning × detector × artifact-correction choices, drawn as a specification curve. |
 
-## Wymagania
+Long, high-rate recordings are drawn with a **min/max envelope** so Plotly stays under Streamlit’s message-size limit. The shape of the session stays visible; the on-screen trace is not every raw sample.
 
-- Python 3.10+ (testowane m.in. na 3.14)
-- Zależności w `requirements.txt` (Streamlit, Plotly, pandas, NumPy, SciPy)
+`eda_qc.py` and `rsp_qc.py` are library modules (NeuroKit2 wrappers for EDA and the two respiration belts). They are not wired into a tab yet.
 
-## Instalacja i uruchomienie
+## Requirements
 
-1. **Sklonuj repozytorium** (lub rozpakuj archiwum) i przejdź do folderu projektu:
-   ```bash
-   cd psychophysio-dashboard
-   ```
-2. **Zainstaluj zależności:**
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
-   Na Windowsie, jeśli `python` nie jest w PATH:
-   ```bash
-   py -3 -m pip install -r requirements.txt
-   ```
-3. **Dodaj własne dane do folderu `data/`** (w katalogu projektu, obok `app.py` — folder nazywa się dokładnie **`data`**). Tam kładziesz pliki sesji, które chcesz przeglądać; aplikacja **skanuje `data/` rekurencyjnie** (możesz też użyć podfolderów). Surowe nagrania zwykle **nie są commitowane** do Gita — patrz `.gitignore`.
-   - **BrainVision:** skopiuj **`*.vhdr`** oraz **`*.eeg`** o nazwie z pola `DataFile=` w `[Common Infos]` nagłówka (np. `DataFile=MK_0123.eeg` → plik `data/MK_0123.eeg` **obok** tego samego `.vhdr`), opcjonalnie **`*.vmrk`** i inne pliki z rekordera. Bez **niepustego** `.eeg` wczytanie próbek się nie uda — w UI pojawi się komunikat z rozmiarem ścieżki.
-   - **Transkrypt (opcjonalnie):** JSON lub CSV wg formatu z `data/transcript.example.json` / opisu w aplikacji — możesz trzymać go w `data/` i wskazać w sidebarze.
-4. **Uruchom:**
-   ```bash
-   python -m streamlit run app.py
-   ```
-   (lub `py -3 -m streamlit run app.py` na Windowsie.)
+- Python 3.10 or newer (also run on 3.14)
+- Packages in `requirements.txt`: Streamlit, Plotly, pandas, NumPy, SciPy, NeuroKit2
 
-Domyślnie: `http://localhost:8501`. W sidebarze: źródło danych, wybór `.vhdr` z listy (pliki z `data/`), ewentualnie plik transkryptu.
+NeuroKit2 is required for R-peak detection, HRV, and the multiverse tab. The session view still opens without it.
 
-## Lokalizacja danych (własny folder, ustawiany raz)
+## Install and run
 
-Domyślnie aplikacja czyta z folderu `data/` obok `app.py`, ale lokalizację można **przestawić raz** na dowolny folder (np. dysk z dużymi danymi poza repo):
+From this folder (`psychophysio-dashboard`, next to `app.py`):
 
-- **Z poziomu UI:** sidebar → expander **„📁 Lokalizacja danych”** → wpisz ścieżkę → **Zapisz**. Zapisuje się do pliku `data_dir.local` (w `.gitignore`, czyli per maszyna), więc po następnym uruchomieniu aplikacja czyta z tej samej lokalizacji. Przycisk **„Domyślny”** wraca do `data/`.
-- **Zmienną środowiskową:** `PSYPHY_DATA_DIR=/ścieżka/do/danych` — **ma priorytet** nad ustawieniem z UI (przydatne w CI / na serwerze). Przykład (PowerShell): `setx PSYPHY_DATA_DIR "D:\dane\psyphy"`.
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
 
-We wskazanym folderze obowiązuje ta sama struktura co w `data/`: BrainVision (`.vhdr`/`.eeg`/`.vmrk`), CASE (`.../interpolated/physiological/sub_*.csv`), transkrypty. Priorytet: **zmienna środowiskowa → `data_dir.local` → domyślny `data/`**.
+On Windows, if `python` is not on `PATH`:
 
-## Struktura projektu
+```bash
+py -3 -m pip install -r requirements.txt
+py -3 -m streamlit run app.py
+```
 
-| Plik / folder | Opis |
-|---------------|------|
-| `app.py` | Aplikacja Streamlit (zakładki: sesja, galeria, QC ECG) |
-| `data_loader.py` | BrainVision: nagłówek `.vhdr`, multipleks INT16 z `.eeg` |
-| `case_loader.py` | CASE: wczytanie `interpolated/physiological/sub_*.csv`, segmenty z kolumny `video` |
-| `bv_markers.py` | Parsowanie `.vmrk`, czasy markerów **New Segment** |
-| `session_geom.py` | Krawędzie segmentów (równy podział albo z markerów) |
-| `data_validation.py` | Raporty walidacji BV i transkryptu |
-| `ecg_qc.py` | Preprocessing i heurystyczny QC toru `ecg_mv` |
-| `transcript_io.py` | Wczytywanie transkryptu JSON / CSV |
-| `viz_gallery.py` | Wykresy galerii |
-| `data/` | Dane sesji, przykłady transkryptów; opcjonalnie `validation_samples/` (małe pliki BV do testów QC) |
-| `.gitignore` | m.in. `__pycache__/` |
+The app opens at `http://localhost:8501`. The sidebar chooses the signal source, the optional transcript, and how the time axis is shown: full session, a window around the cursor, or one segment.
 
-## Dane w `data/`
+## Where data lives
 
-- **BrainVision:** spójny zestaw `.vhdr` + `.eeg` (i ewentualnie `.vmrk`). Pliki `Data-*.txt` to **logi impedancji**, nie szereg czasowy sygnału.
-- **Repozytorium:** w `.gitignore` są wzorce na surowe pliki sesji w `data/` (`.eeg`, `.vhdr`, `.vmrk`, logi impedancji, transkrypt JSON poza przykładem, folder `articles/`), a także zbiór CASE (`data/CASE_full/`). **Małe fixture’y** zostają w `data/validation_samples/`. **RODO / etyka** przy udostępnianiu danych poza Gitem.
+By default the app reads `data/` next to `app.py` and scans it **recursively**. Point it at another folder once; the choice is remembered.
 
-## Dane CASE (Sharma et al. 2019)
+| Priority | Source |
+| --- | --- |
+| 1 | Environment variable `PSYPHY_DATA_DIR` |
+| 2 | Path saved in `data_dir.local` (gitignored, one file per machine) |
+| 3 | `data/` next to `app.py` |
 
-CASE to otwarty zbiór ciągłych sygnałów fizjologicznych nagranych podczas oglądania filmów emocjonalnych (30 osób). Zawiera **prawdziwe ECG**, dlatego używamy go do zakładki QC/preprocessing ECG i analiz HRV.
+Set the folder in the sidebar under **Lokalizacja danych** (**Zapisz** writes `data_dir.local`; **Domyślny** returns to `data/`). `PSYPHY_DATA_DIR` overrides the UI, which is the setting to use on a server:
 
-- **Źródło:** Sharma, K., Castellini, C., van den Broek, E. L., Albu-Schaeffer, A., Schwenker, F. (2019). *A dataset of continuous affect annotations and physiological signals for emotion analysis.* Scientific Data 6, 196. DOI **10.1038/s41597-019-0209-0**. Pełna paczka danych jest hostowana na **figshare** (link w artykule; pobierasz archiwum „full”).
-- **Dane są poza Gitem** (`.gitignore`) — po sklonowaniu repo musisz pobrać CASE samodzielnie.
-- **Rozpakowanie:** wypakuj tak, aby istniała ścieżka
-  `data/CASE_full/data/interpolated/physiological/sub_*.csv`
-  (loader szuka katalogu zawierającego `.../interpolated/physiological`, więc dokładna nazwa folderu nadrzędnego nie jest krytyczna).
-- **Wariant:** korzystamy z **`interpolated`** (1000 Hz, równa siatka czasu). To jest **sygnał surowy** — CASE **nie filtruje** fizjologii (dodaje tylko video-ID, konwersję jednostek części kanałów i interpolację liniową). Filtracja (Stage 2: HP/LP/notch) jest **po Twojej stronie** w aplikacji.
-- **Mapowanie kanałów** (w `case_loader.py`):
+```bash
+# bash
+export PSYPHY_DATA_DIR=/path/to/recordings
 
-| CASE | kolumna aplikacji | uwaga |
-|------|-------------------|-------|
-| `ecg` | `ecg_mv` | **prawdziwe ECG** (w woltach) |
-| `rsp` | `oddech` | pas oddechowy |
-| `gsr` | `eda_us` | przewodność skóry |
-| `bvp` | `puls_bpm` | BVP/PPG — **przebieg pulsu, nie BPM** |
-| `daqtime/1000` | `time_s` | `daqtime` jest w ms |
+# PowerShell (persists for the user)
+setx PSYPHY_DATA_DIR "D:\data\psyphy"
+```
 
-- **Segmenty = wideo:** kolumna `video` koduje bodziec; loader buduje z niej segmenty (8 wideo emocjonalnych + `bluVid`/`startVid`/`endVid`). W sidebarze wybierasz **podmiot** i **segment** — domyślnie pierwsze wideo emocjonalne (~2–3 min, szybki pipeline). Opcja **„Cała sesja”** ładuje ~2,5 mln próbek (wolne).
+The chosen folder uses the same layout as `data/`: BrainVision files, an optional CASE tree, trigger logs, and transcripts.
 
-## Zagadnienia do rozważenia
+## Signal sources
 
-- **Synchronizacja czasu** między rekorderem BV, audio, transkryptem (wspólna oś w sekundach vs osobne korekty).
-- **Publikacja vs eksploracja:** które wersje sygnału (surowy / filtrowany / decymowany) idą do rozdziałów metody i figur.
-- **Segmentacja:** inne typy markerów BV (Stimulus, Response…) na osi czasu i w etykietach bloków — obecnie tylko **New Segment** buduje podział.
-- **Jednostki i nazewnictwo:** oś „puls” jako sygnał z czujnika (µV) vs wyliczone BPM; spójność podpisów osi z metodą.
-- **QC i HRV:** obecna detekcja R to orientacyjny pipeline — przed analizą HRV warto ustalić finalny łańcuch z narzędziami klinicznymi lub zespołową procedurą.
+### Synthetic demo
 
-## Dalsze kroki rozwoju (skrót)
+The default source. A 60-minute session at 250 Hz, split into six equal blocks, with a synthetic ECG (PQRST plus baseline wander, 50 Hz, and broadband noise) so the QC tab has something to show. The sidebar seed controls the random generator.
 
-- Podgląd **wszystkich** markerów `.vmrk` na osi czasu i wybór typu do segmentacji (nie tylko **New Segment**).
-- **Kwestionariusze** (CSV) i łączenie z `subject_id` / sesją na wykresach.
-- Moduł **EEG** (osobna ścieżka czasu, epoki, ewentualnie MNE).
-- Eksport figur (rozdzielczość, fonty) i ewentualnie testy automatyczne dla `data_loader` / walidacji.
+### BrainVision (`.vhdr` + `.eeg`)
 
-## Licencja i cytowanie
+Place the header and the sample file named by `DataFile=` in `[Common Infos]` **side by side** (subfolders are fine). A matching `.vmrk` is optional. `Data-*.txt` files are **impedance logs**, not time series.
 
-Dodaj `LICENSE` i zasady cytowania, jeśli projekt ma być publiczny.
+The `.vhdr` parser reads channel names and resolutions only from **`[Channel Infos]`**. `ChN=…` lines in `[Coordinates]` do not overwrite the scale.
 
-## Autorstwo
+Channels are matched **by name** (case-insensitive). If the auxiliary names are missing, a 64+4 recording falls back to channels 65–68.
 
-Uzupełnij autorów / kontakt według potrzeb pracy lub zespołu.
+| App column | Typical BrainVision name | Meaning in a BrainVision file |
+| --- | --- | --- |
+| `resp_t` (alias `oddech`) | Resp01T | Thoracic respiration belt |
+| `resp_b` (alias `ecg_mv`) | Resp02B | Abdominal belt. **Not ECG.** |
+| `eda_us` | GSR | Skin conductance |
+| `hr_aux_uv` (alias `puls_bpm`) | HR | Recorder trace in µV. **Not beats per minute.** |
+| `ppg` | PPG | Finger PPG, when that channel exists |
+
+The ECG tab always reads the column `ecg_mv`. On a typical BrainVision auxiliary montage that column is the second respiration belt, and R-peak or HRV numbers from it are not cardiac. The loader warns when the header has no channel whose name looks like ECG. Use the **CASE** source when you want a real ECG.
+
+### CASE (Sharma et al., 2019)
+
+Open dataset of continuous physiology recorded while 30 people watched emotional films. It is the source with a **real ECG**, so it is the one to use for the ECG and multiverse tabs.
+
+- Sharma, K., Castellini, C., van den Broek, E. L., Albu-Schaeffer, A., & Schwenker, F. (2019). A dataset of continuous affect annotations and physiological signals for emotion analysis. *Scientific Data, 6*, 196. <https://doi.org/10.1038/s41597-019-0209-0>
+- Download the **full** archive from figshare (link in the paper). It is not in git.
+
+Unpack it so this path exists (the parent folder name can differ; the loader looks for `interpolated/physiological`):
+
+```text
+data/CASE_full/data/interpolated/physiological/sub_*.csv
+```
+
+The loader uses the **interpolated** release: 1000 Hz, evenly sampled. CASE does not filter the physiology; it adds a video id, converts some units, and linearly interpolates. Filtering happens in the app.
+
+| CASE column | App column | Meaning |
+| --- | --- | --- |
+| `ecg` | `ecg_mv` | ECG, in volts |
+| `rsp` | `oddech` | Respiration belt |
+| `gsr` | `eda_us` | Skin conductance |
+| `bvp` | `puls_bpm` | BVP/PPG **waveform**, not BPM |
+| `daqtime / 1000` | `time_s` | `daqtime` is in milliseconds |
+
+Segments follow the `video` column (eight emotional films plus `startVid`, `bluVid`, and `endVid`). Pick a **subject** and a **segment** in the sidebar. The default is the first emotional video (about 2–3 minutes). **Cała sesja** loads the whole recording (on the order of 2.5 million samples) and is slow.
+
+### CALM trigger logs
+
+If a BrainVision header sits next to exactly one `*triggers*.log` (or you pick one when several exist), segment boundaries come from CALM code pairs in `calm_triggers.py`. Times are relative to trigger code **1** (experiment start). Incomplete pairs are skipped; if none are complete, the app falls back to `.vmrk` or to equal blocks.
+
+### Segments when there is no CALM log and no CASE video column
+
+| Markers in `.vmrk` | Segments |
+| --- | --- |
+| Several `New Segment` markers | One block per marker. Time comes from the sample position and the header sampling rate. |
+| A single `New Segment`, or none | Six equal blocks, same as the synthetic session. |
+
+Other marker types (`Stimulus`, `Response`, …) are parsed but do not define segments.
+
+### Transcript
+
+Optional. JSON or CSV, times in **seconds from the start of the session**.
+
+```json
+{
+  "utterances": [
+    { "start_s": 5.0, "end_s": 18.0, "text": "First turn." }
+  ]
+}
+```
+
+CSV uses the header `start_s,end_s,text`. A full example is `data/transcript.example.json`. In the sidebar, enable **Wczytaj transkrypt z pliku** and upload the file. **Dopisz przykład…** appends the example file to whatever is already loaded; validation then covers the merged list.
+
+## Checks after loading
+
+An expander (**Walidacja jakości wczytanych danych**) runs when a BrainVision file or a user transcript is loaded.
+
+- **BrainVision:** sampling rate, missing samples, flat or all-zero auxiliary channels.
+- **Transcript:** empty list, `end` not after `start`, negative starts, gaps vs. session length, overlapping turns, empty text.
+
+These checks do not certify a recording.
+
+Small fixtures live in `data/validation_samples/` (three BrainVision pairs and several transcripts). Regenerate the BrainVision files with:
+
+```bash
+python data/validation_samples/generate_bv_fixtures.py
+```
+
+See `data/validation_samples/README.txt` for which file should pass, warn, or fail.
+
+## Project layout
+
+| Path | Role |
+| --- | --- |
+| `app.py` | Streamlit app: sidebar, session, gallery, ECG QC, multiverse |
+| `data_loader.py` | BrainVision header and multiplexed INT16 `.eeg` |
+| `case_loader.py` | CASE `sub_*.csv` and video segments |
+| `bv_markers.py` | `.vmrk` markers and `New Segment` times |
+| `calm_triggers.py` | CALM `*triggers*.log` and analysis windows |
+| `session_geom.py` | Segment edges (equal split, markers, or disjoint windows) |
+| `data_validation.py` | BrainVision and transcript reports |
+| `transcript_io.py` | JSON and CSV transcripts |
+| `ecg_qc.py` | ECG cleaning, R peaks, artifact correction, HRV |
+| `eda_qc.py` | EDA cleaning, tonic/phasic split, SCR peaks (library) |
+| `rsp_qc.py` | Respiration cleaning, rate, belt coupling (library) |
+| `signal_qc_base.py` | Shared windowing and signal-quality helpers |
+| `viz_gallery.py` | Gallery figures |
+| `data/` | Example transcript, validation fixtures, local recordings |
+| `THESIS_NOTES.md` | Working notes on short-term HRV (Polish) |
+
+Raw session files are gitignored: `data/*.eeg`, `*.vhdr`, `*.vmrk`, impedance logs, JSON other than `transcript.example.json`, `data/articles/`, and the CASE tree (`data/CASE_full/`, `data/9891446/`). The validation fixtures stay in the repository. Treat recordings under `data/` as personal data when you copy them off the machine.
+
+## Things that change the numbers
+
+- **`ecg_mv` and `puls_bpm` mean different things per source.** Synthetic: a generated ECG, and a pulse trace near BPM. BrainVision: second respiration belt, and a µV heart-rate channel. CASE: real ECG in volts, and a BVP/PPG waveform. Read the loader message before interpreting the ECG tab.
+- **Sampling rate for R peaks.** The ECG tab analyses the raw series, not the ~4 Hz display downsample. Quigley et al. (2024) recommend at least 250 Hz, preferably 1000 Hz. For BrainVision the default is the rate in the header.
+- **Short windows.** Metrics on a 2–3 minute CASE clip are short-term HRV. RMSSD, SDNN, pNN50, and HF are the ones this app treats as usable there; LF and LF/HF need a longer window and a cautious reading. See `THESIS_NOTES.md`.
+- **Time alignment** between the recorder, audio, and the transcript is your offset. The app assumes one shared axis in seconds from session start.
+- **Display vs. analysis.** The smoothed ~4 Hz view is for looking at the session. ECG filtering and peak detection run on the raw samples inside the ECG tab.
+
+## Possible next steps
+
+- Show every `.vmrk` marker on the time axis, and let the user pick which type defines segments.
+- Load questionnaire CSVs and join them on subject or session.
+- An EEG path (epochs, optionally MNE). The current loader keeps the auxiliary channels, not the EEG montage.
+- Surface the EDA and respiration QC modules in the UI.
+- Figure export (resolution, fonts) and automated tests around `data_loader` and validation.
+
+## Software to cite
+
+- Makowski, D., Pham, T., Lau, Z. J., Brammer, J. C., Lespinasse, F., Pham, H., Schölzel, C., & Chen, S. A. (2021). NeuroKit2: A Python toolbox for neurophysiological signal processing. *Behavior Research Methods, 53*(4), 1689–1696. <https://doi.org/10.3758/s13428-020-01516-y>
+- CASE dataset: Sharma et al. (2019), DOI above, when a figure or metric comes from those files.
+
+## License and authorship
+
+Sylwia Puzio — [Sylwiapp](https://github.com/Sylwiapp).
+
+There is no `LICENSE` file yet. Add one before redistributing the code.
