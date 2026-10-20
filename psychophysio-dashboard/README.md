@@ -4,6 +4,26 @@ Streamlit dashboard for exploring one psychophysiological session together with 
 
 This is a **prototype**. Plots, filters, and quality checks are heuristics for exploration. They do not replace a methods section, a lab protocol, or a clinical HRV pipeline. The interface is currently in **Polish**.
 
+## Screenshots
+
+The pictures below are the synthetic 60-minute demo (seed 42), so the ECG is a generated PQRST trace. Labels in the app are Polish.
+
+**Session.** Sidebar on the left, four-channel min–max overlay for the whole hour.
+
+![Session tab: sidebar and the four-channel overlay on the synthetic demo](docs/screenshots/session-overview.png)
+
+**Window around the cursor.** 120 seconds of raw respiration, pulse, ECG, and EDA, with the transcript highlight for the utterance under the red line.
+
+![120-second window with stacked signals and the highlighted transcript](docs/screenshots/session-window.png)
+
+**Gallery.** Mean pulse and EDA, with SD, across the six equal blocks.
+
+![Gallery: segment means for pulse and EDA](docs/screenshots/gallery.png)
+
+**ECG preprocessing.** Fifteen seconds of the synthetic ECG before and after `nk.ecg_clean("neurokit")`, and the Welch spectrum with the 50 Hz power-line band marked.
+
+![ECG tab: raw versus cleaned trace and the power spectrum](docs/screenshots/ecg-clean.png)
+
 ## What you can do
 
 Four tabs share the signal chosen in the sidebar.
@@ -176,6 +196,7 @@ See `data/validation_samples/README.txt` for which file should pass, warn, or fa
 | `rsp_qc.py` | Respiration cleaning, rate, belt coupling (library) |
 | `signal_qc_base.py` | Shared windowing and signal-quality helpers |
 | `viz_gallery.py` | Gallery figures |
+| `docs/screenshots/` | README figures from the synthetic demo |
 | `data/` | Example transcript, validation fixtures, local recordings |
 | `THESIS_NOTES.md` | Working notes on short-term HRV (Polish) |
 
